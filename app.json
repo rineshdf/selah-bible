@@ -5,7 +5,15 @@
     "scheme": "selahbible",
     "version": "1.0.0",
     "plugins": [
-      "expo-router"
+      "expo-router",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "cmakeVersion": "3.31.6"
+          }
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true
