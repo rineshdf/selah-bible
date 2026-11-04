@@ -12,22 +12,23 @@
  * `EmptyHighlightsSvg` shows when nothing matches.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  FlatList,
   LayoutAnimation,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
-  type ScrollViewInstance,
   SectionList,
   StyleSheet,
   Text,
   View,
 } from 'react-native';
 import { useFocusEffect } from 'expo-router';
-import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '@/constants/ThemeContext';
 import { HIGHLIGHT_COLORS, getHighlightStyle, type AppTheme } from '@/constants/colors';
 import { deleteHighlight, getAllHighlights, type HighlightRow } from '@/db/database';
@@ -168,10 +169,160 @@ function identityFromRawKey(rawKey: string): VersionIdentity {
   };
 }
 
+interface HighlightCardProps {
+  /** One `{ row, serial }` datum from the rendered SectionList section. */
+  item: { row: HighlightRow; serial: number };
+  styles: ReturnType<typeof makeStyles>;
+  isDark: boolean;
+  /** Row-body surface color from the active theme (primitive prop). */
+  surfaceColor: string;
+  /** Stable helpers resolved once per row render inside the card. */
+  identityFor: (row: HighlightRow) => VersionIdentity;
+  labelFor: (row: HighlightRow | null) => string;
+  onPress: (row: HighlightRow) => void;
+  onDelete: (row: HighlightRow) => void;
+}
+
+/**
+ * Memoized highlight card: every prop except `item` is a stable reference or
+ * primitive, so opening the reader / editing a row only re-renders the rows
+ * whose data changed instead of the whole virtualized list.
+ */
+const HighlightCard = memo(function HighlightCard({
+  item,
+  styles,
+  isDark,
+  surfaceColor,
+  identityFor,
+  labelFor,
+  onPress,
+  onDelete,
+}: HighlightCardProps) {
+  const { row, serial } = item;
+  const identity = identityFor(row);
+  const bookLabel = labelFor(row);
+  // 3px left accent border in the highlight's palette color.
+  const accent = getHighlightStyle(row.color_hex, isDark);
+  return (
+    <View style={styles.rowCard}>
+      <ScalePressable
+        style={[
+          styles.rowBody,
+          {
+            backgroundColor: surfaceColor,
+            borderLeftWidth: 3,
+            borderLeftColor: accent.borderColor,
+          },
+        ]}
+        onPress={() => onPress(row)}
+        accessibilityRole="button"
+        accessibilityLabel={`Read ${bookLabel} ${row.chapter}:${row.verse} in the full chapter reader`}
+      >
+        <View style={styles.rowTopLine}>
+          <SerialBadge number={serial} color={row.color_hex} />
+          <Text style={styles.rowReference}>
+            {bookLabel} {row.chapter}:{row.verse}
+          </Text>
+          <Text style={styles.rowJumpHint}>Read →</Text>
+        </View>
+        <View style={styles.versionPill}>
+          <Text style={styles.versionPillText}>
+            {identity.pillLabel}
+          </Text>
+        </View>
+        <Text numberOfLines={3} style={styles.rowText}>
+          {row.verse_text}
+        </Text>
+      </ScalePressable>
+      <Pressable
+        style={styles.rowDelete}
+        hitSlop={8}
+        onPress={() => onDelete(row)}
+        accessibilityRole="button"
+        accessibilityLabel={`Delete highlight ${bookLabel} ${row.chapter}:${row.verse}`}
+      >
+        <Text style={styles.rowDeleteIcon}>✕</Text>
+      </Pressable>
+    </View>
+  );
+});
+
+interface ReaderVerseProps {
+  verseNumber: number;
+  verseText: string;
+  highlightBg: string | null;
+  highlightBorder: string | null;
+  highlightText: string | null;
+  isTarget: boolean;
+  isDark: boolean;
+  styles: ReturnType<typeof makeStyles>;
+}
+
+/**
+ * Reader chapter row — memoized on primitives so long chapters scroll fast.
+ * FIX 1: unhighlighted verses render with explicit slates (light `#F1F5F9`
+ * text on dark, deep `#0F172A` on light) instead of the raw default, which is
+ * pitch black and invisible on the dark reader background.
+ */
+const ReaderVerseRow = memo(function ReaderVerseRow({
+  verseNumber,
+  verseText,
+  highlightBg,
+  highlightBorder,
+  highlightText,
+  isTarget,
+  isDark,
+  styles,
+}: ReaderVerseProps) {
+  // Plain-verse palette (FIX 1): never black in Dark Mode.
+  const baseTextColor = isDark ? '#F1F5F9' : '#0F172A';
+  const numberBadgeColor = isDark ? '#94A3B8' : '#475569';
+  const numberBadgeBg = isDark ? '#1E293B' : '#F1F5F9';
+  return (
+    <View
+      style={[
+        styles.readerVerse,
+        highlightBg ? { backgroundColor: highlightBg } : null,
+        highlightBorder ? { borderLeftWidth: 3, borderLeftColor: highlightBorder } : null,
+        isTarget ? styles.readerVerseTarget : null,
+        isTarget && isDark ? styles.readerVerseTargetDark : null,
+      ]}
+    >
+      <View
+        style={[
+          styles.readerVerseNumberBadge,
+          { backgroundColor: highlightBg ?? numberBadgeBg },
+        ]}
+      >
+        <Text
+          style={[
+            styles.readerVerseNumber,
+            { color: highlightBorder ?? numberBadgeColor },
+          ]}
+        >
+          {verseNumber}
+        </Text>
+      </View>
+      <Text
+        style={[styles.readerVerseText, { color: highlightText ?? baseTextColor }]}
+      >
+        {verseText}
+      </Text>
+      {isTarget ? (
+        <View style={[styles.readerTargetPill, isDark ? styles.readerTargetPillDark : null]}>
+          <Text style={styles.readerTargetPillText}>★ Highlighted Verse</Text>
+        </View>
+      ) : null}
+    </View>
+  );
+});
+
 export default function HighlightsScreen() {
   const { theme } = useAppTheme();
-  const styles = makeStyles(theme);
+  const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
+  /** Reader modal header sits just below the status bar — no dead black gap. */
+  const modalHeaderTop = Platform.OS === 'android' ? 8 : insets.top + 6;
 
   const [highlights, setHighlights] = useState<HighlightRow[]>([]);
   const [installedMetas, setInstalledMetas] = useState<BibleVersionMeta[]>([]);
@@ -187,9 +338,8 @@ export default function HighlightsScreen() {
   const [contextProgress, setContextProgress] = useState<number | null>(null);
   const [contextAvailable, setContextAvailable] = useState(false);
 
-  const scrollRef = useRef<ScrollViewInstance | null>(null);
-  /** verse number -> y offset inside the reader, captured on layout. */
-  const verseYPositions = useRef(new Map<number, number>());
+  /** Reader chapter list — drives scrollToIndex for the highlighted verse. */
+  const chapterListRef = useRef<FlatList<ChapterVerse> | null>(null);
 
   const reload = useCallback(() => {
     setHighlights(getAllHighlights());
@@ -411,14 +561,16 @@ export default function HighlightsScreen() {
     setContextError(null);
     setContextIdentity(identity);
     setContextLoading(true);
-    verseYPositions.current.clear();
     const resolvedVersionId = row.version_key || identity.id || TAMIL_BSI_ID;
     const resolvedId = normalizeVersionId(resolvedVersionId);
     try {
       const installed = await isVersionDownloaded(resolvedId);
       if (installed) {
         setContextAvailable(true);
-        setContextVerses(await loadChapterVerses(resolvedId, row.book_id, row.chapter));
+        // Partial versions redirect missing books/chapters — the reader shows
+        // exactly what the version actually serves.
+        const loaded = await loadChapterVerses(resolvedId, row.book_id, row.chapter);
+        setContextVerses(loaded.verses);
       } else {
         setContextAvailable(false);
         setContextError('This Bible version is not on this device. Download it to read the full chapter.');
@@ -435,16 +587,32 @@ export default function HighlightsScreen() {
     }
   }, [identityForRow]);
 
-  /** Once the reader is ready, scroll the highlighted verse into view. */
+  /** Once the reader is ready, scroll the highlighted verse into view (22% from top). */
   useEffect(() => {
-    if (!contextHighlight || !contextAvailable) return;
-    const verseY = verseYPositions.current.get(contextHighlight.verse);
-    if (verseY === undefined) return;
+    if (!contextHighlight || !contextAvailable || contextVerses.length === 0) return;
+    const index = contextVerses.findIndex((verse) => verse.verse === contextHighlight.verse);
+    if (index < 0) return;
     const timer = setTimeout(() => {
-      scrollRef.current?.scrollTo({ y: Math.max(0, verseY - 140), animated: false });
-    }, 80);
+      try {
+        chapterListRef.current?.scrollToIndex({ index, viewPosition: 0.22, animated: false });
+      } catch {
+        // Estimation failures are non-fatal: the chapter itself is open.
+      }
+    }, 150);
     return () => clearTimeout(timer);
   }, [contextAvailable, contextHighlight, contextVerses]);
+
+  /** FlatList frame-estimation fallback: land near the verse, then let the
+   *  effect retry positioning when the target row finishes measuring. */
+  const handleScrollToIndexFailed = useCallback(
+    (info: { index: number; averageItemLength: number }) => {
+      chapterListRef.current?.scrollToOffset({
+        offset: Math.max(0, info.index * info.averageItemLength),
+        animated: false,
+      });
+    },
+    [],
+  );
 
   const handleRedownloadContext = useCallback(async () => {
     if (!contextHighlight) return;
@@ -467,7 +635,8 @@ export default function HighlightsScreen() {
     setContextProgress(0);
     try {
       await downloadBibleVersion(version, (event) => setContextProgress(event.percent));
-      setContextVerses(await loadChapterVerses(identity.id, contextHighlight.book_id, contextHighlight.chapter));
+      const loaded = await loadChapterVerses(identity.id, contextHighlight.book_id, contextHighlight.chapter);
+      setContextVerses(loaded.verses);
       setContextAvailable(true);
       setContextError(null);
     } catch (error) {
@@ -496,69 +665,40 @@ export default function HighlightsScreen() {
     );
   }, [localizedBookNameFor]);
 
+  /** Rows feed the memoized `HighlightCard`; all callback props stay stable. */
   const renderHighlightRow = useCallback(
-    ({ item }: { item: { row: HighlightRow; serial: number } }) => {
-      const row = item.row;
-      const identity = identityForRow(row);
-      // 3px left accent border in the highlight's palette color.
-      const accent = getHighlightStyle(row.color_hex, theme.isDark);
-      return (
-        <View style={styles.rowCard}>
-          <ScalePressable
-            style={[
-              styles.rowBody,
-              {
-                backgroundColor: theme.surface,
-                borderLeftWidth: 3,
-                borderLeftColor: accent.borderColor,
-              },
-            ]}
-            onPress={() => void handleJumpToVerse(row)}
-            accessibilityRole="button"
-            accessibilityLabel={`Read ${localizedBookNameFor(row)} ${row.chapter}:${row.verse} in the full chapter reader`}
-          >
-            <View style={styles.rowTopLine}>
-              <SerialBadge number={item.serial} color={row.color_hex} />
-              <Text style={styles.rowReference}>
-                {localizedBookNameFor(row)} {row.chapter}:{row.verse}
-              </Text>
-              <Text style={styles.rowJumpHint}>Read →</Text>
-            </View>
-            <View style={styles.versionPill}>
-              <Text numberOfLines={1} style={styles.versionPillText}>
-                {identity.pillLabel}
-              </Text>
-            </View>
-            <Text numberOfLines={3} style={styles.rowText}>
-              {row.verse_text}
-            </Text>
-          </ScalePressable>
-          <Pressable
-            style={styles.rowDelete}
-            hitSlop={8}
-            onPress={() => handleDelete(row)}
-            accessibilityRole="button"
-            accessibilityLabel={`Delete highlight ${localizedBookNameFor(row)} ${row.chapter}:${row.verse}`}
-          >
-            <Text style={styles.rowDeleteIcon}>✕</Text>
-          </Pressable>
-        </View>
-      );
-    },
-    [handleDelete, handleJumpToVerse, identityForRow, localizedBookNameFor, styles, theme],
+    ({ item }: { item: { row: HighlightRow; serial: number } }) => (
+      <HighlightCard
+        item={item}
+        styles={styles}
+        isDark={theme.isDark}
+        surfaceColor={theme.surface}
+        identityFor={identityForRow}
+        labelFor={localizedBookNameFor}
+        onPress={handleJumpToVerse}
+        onDelete={handleDelete}
+      />
+    ),
+    [handleDelete, handleJumpToVerse, identityForRow, localizedBookNameFor, styles, theme.isDark, theme.surface],
   );
 
+  /** Stable date-group header so SectionList never re-aligns rows needlessly. */
+  const renderSectionHeader = useCallback(
+    ({ section }: { section: { title: string } }) => (
+      <Text style={styles.sectionHeader}>{section.title}</Text>
+    ),
+    [styles],
+  );
+
+  /** Stable row keys for the SectionList reconciliation. */
+  const highlightKey = useCallback((item: { row: HighlightRow }) => `${item.row.id}`, []);
+
   return (
-    <View
-      style={[
-        styles.screen,
-        { backgroundColor: theme.background, paddingTop: insets.top },
-      ]}
-    >
+    <View style={[styles.screen, { backgroundColor: theme.background }]}>
       {/* Compact top bar with the global theme toggle on the right */}
       <AppHeader
         title="Highlights"
-        left={
+        right={
           <Text style={styles.headerCount}>
             {filtered.length} {filtered.length === 1 ? 'verse' : 'verses'}
           </Text>
@@ -624,11 +764,13 @@ export default function HighlightsScreen() {
         style={styles.sectionList}
         contentContainerStyle={styles.sectionListContent}
         sections={sections}
-        keyExtractor={(item) => `${item.row.id}`}
+        keyExtractor={highlightKey}
         renderItem={renderHighlightRow}
-        renderSectionHeader={({ section }) => (
-          <Text style={styles.sectionHeader}>{section.title}</Text>
-        )}
+        renderSectionHeader={renderSectionHeader}
+        initialNumToRender={15}
+        maxToRenderPerBatch={15}
+        windowSize={5}
+        removeClippedSubviews={Platform.OS === 'android'}
         ListEmptyComponent={
           <AnimatedCard>
             <View style={styles.emptyCard}>
@@ -654,9 +796,14 @@ export default function HighlightsScreen() {
         presentationStyle="fullScreen"
         onRequestClose={() => setContextHighlight(null)}
       >
-        <SafeAreaView style={[styles.readerScreen, { backgroundColor: theme.background }]}>
-          {/* Reader header */}
-          <View style={styles.readerHeader}>
+        <View style={[styles.readerScreen, { backgroundColor: theme.background }]}>
+          {/* Reader header — padding that clears the status bar with zero dead gap */}
+          <View
+            style={[
+              styles.readerHeader,
+              { paddingTop: modalHeaderTop, paddingBottom: 10 },
+            ]}
+          >
             <ScalePressable
               style={styles.readerClose}
               onPress={() => setContextHighlight(null)}
@@ -666,13 +813,13 @@ export default function HighlightsScreen() {
               <Text style={styles.readerCloseText}>Close ✕</Text>
             </ScalePressable>
             <View style={styles.readerHeaderMeta}>
-              <Text numberOfLines={1} style={styles.readerTitle}>
+              <Text style={styles.readerTitle}>
                 {contextHighlight
                   ? `${localizedBookNameFor(contextHighlight)} ${contextHighlight.chapter}`
                   : 'Chapter'}
               </Text>
               <View style={styles.readerSubtitlePill}>
-                <Text numberOfLines={1} style={styles.readerSubtitlePillText}>
+                <Text style={styles.readerSubtitlePillText}>
                   {contextIdentity?.fullLabel ?? contextHighlight?.version_key ?? FALLBACK_IDENTITY.fullLabel}
                 </Text>
               </View>
@@ -702,54 +849,39 @@ export default function HighlightsScreen() {
           ) : null}
 
           {contextAvailable && contextHighlight && !contextLoading ? (
-            <ScrollView
-              ref={scrollRef}
-              contentContainerStyle={styles.readerVerses}
-            >
-              {contextVerses.map((verse) => {
+            <FlatList
+              ref={chapterListRef}
+              data={contextVerses}
+              keyExtractor={(verse) => String(verse.verse)}
+              renderItem={({ item }) => {
                 // ALL verses highlighted (in any palette color) on this date
                 // in this chapter get their adaptive highlight style.
-                const chapterHighlight = contextChapterHighlights.get(verse.verse);
+                const chapterHighlight = contextChapterHighlights.get(item.verse);
                 const highlightStyle = chapterHighlight
                   ? getHighlightStyle(chapterHighlight.color_hex, theme.isDark)
                   : null;
                 return (
-                  <View
-                    key={verse.verse}
-                    style={[
-                      styles.readerVerse,
-                      highlightStyle
-                        ? {
-                            backgroundColor: highlightStyle.backgroundColor,
-                            borderLeftWidth: 3,
-                            borderLeftColor: highlightStyle.borderColor,
-                          }
-                        : null,
-                    ]}
-                    onLayout={(event) => verseYPositions.current.set(verse.verse, event.nativeEvent.layout.y)}
-                  >
-                    <Text
-                      style={[
-                        styles.readerVerseNumber,
-                        highlightStyle ? { color: highlightStyle.borderColor } : null,
-                      ]}
-                    >
-                      {verse.verse}
-                    </Text>
-                    <Text
-                      style={[
-                        styles.readerVerseText,
-                        { color: highlightStyle ? highlightStyle.textColor : theme.text },
-                      ]}
-                    >
-                      {verse.text}
-                    </Text>
-                  </View>
+                  <ReaderVerseRow
+                    verseNumber={item.verse}
+                    verseText={item.text}
+                    highlightBg={highlightStyle?.backgroundColor ?? null}
+                    highlightBorder={highlightStyle?.borderColor ?? null}
+                    highlightText={highlightStyle?.textColor ?? null}
+                    isTarget={item.verse === contextHighlight.verse}
+                    isDark={theme.isDark}
+                    styles={styles}
+                  />
                 );
-              })}
-            </ScrollView>
+              }}
+              extraData={`${contextHighlight.verse}|${theme.isDark}`}
+              contentContainerStyle={styles.readerVerses}
+              onScrollToIndexFailed={handleScrollToIndexFailed}
+              initialNumToRender={12}
+              maxToRenderPerBatch={12}
+              windowSize={7}
+            />
           ) : null}
-        </SafeAreaView>
+        </View>
       </Modal>
 
       <PremiumCalendarModal
@@ -892,7 +1024,6 @@ function makeStyles(theme: AppTheme) {
       alignItems: 'center',
       gap: 10,
       paddingHorizontal: 16,
-      paddingVertical: 12,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
       backgroundColor: theme.surface,
@@ -955,14 +1086,47 @@ function makeStyles(theme: AppTheme) {
       paddingVertical: 7,
       paddingHorizontal: 8,
       borderRadius: 8,
+      overflow: 'visible',
+    },
+    /** Target verse: 2px accent ring so it stands out from palette tints. */
+    readerVerseTarget: {
+      borderWidth: 2,
+      borderColor: theme.primary,
+      paddingVertical: 5,
+      paddingHorizontal: 6,
+    },
+    readerVerseTargetDark: { borderColor: theme.primary },
+    readerTargetPill: {
+      position: 'absolute',
+      top: -10,
+      right: 8,
+      borderRadius: 999,
+      backgroundColor: theme.primary,
+      paddingHorizontal: 8,
+      paddingVertical: 3,
+    },
+    readerTargetPillDark: { backgroundColor: theme.primary },
+    readerTargetPillText: {
+      color: theme.primaryForeground,
+      fontSize: 10,
+      fontWeight: '800',
+      letterSpacing: 0.2,
+    },
+    /** FIX 1 — verse number badge: visible in both themes on a solid capsule. */
+    readerVerseNumberBadge: {
+      minWidth: 26,
+      minHeight: 22,
+      paddingHorizontal: 6,
+      paddingVertical: 2,
+      borderRadius: 7,
+      alignItems: 'flex-end',
+      justifyContent: 'center',
+      marginTop: 6,
     },
     readerVerseNumber: {
-      color: theme.primary,
       fontSize: 12,
       fontWeight: '800',
-      minWidth: 20,
       textAlign: 'right',
-      marginTop: 8,
     },
     readerVerseText: {
       flex: 1,

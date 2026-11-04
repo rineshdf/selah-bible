@@ -1,12 +1,16 @@
 /**
- * Compact reusable top bar — 44dp tall so center content keeps maximum
- * screen space. The top-right always renders the SVG Sun/Moon dark & light
- * toggle (Step 1); screens can add custom right widgets before it.
+ * Compact reusable top bar that starts continuous from the status bar: the
+ * status-bar inset is padding INSIDE the header (no SafeAreaView wrapper, no
+ * dead gap), then one row of content. The top-right always renders the SVG
+ * Sun/Moon dark & light toggle (Step 1); screens can add custom right
+ * widgets before it.
  */
 
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Platform, Pressable, StatusBar, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '@/constants/ThemeContext';
 import { SunMoonSvg } from '@/components/SvgIcons';
+import SelahAppIconSvg from '@/components/SelahAppIconSvg';
 import type { AppTheme } from '@/constants/colors';
 
 export interface AppHeaderProps {
@@ -16,15 +20,29 @@ export interface AppHeaderProps {
   right?: React.ReactNode;
   /** Optional single-line title drawn after `left`. */
   title?: string;
+  /** Set to true to hide the default Selah icon when no custom `left` is provided. */
+  hideIcon?: boolean;
 }
 
-export default function AppHeader({ left, right, title }: AppHeaderProps) {
+export default function AppHeader({ left, right, title, hideIcon }: AppHeaderProps) {
   const { theme, themeMode, toggleTheme } = useAppTheme();
+  const insets = useSafeAreaInsets();
+  const topInset = Math.max(
+    insets.top,
+    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 24) : 0,
+    Platform.OS === 'ios' ? 20 : 24,
+  );
   const styles = makeStyles(theme);
   return (
-    <View style={styles.bar}>
-      <View style={styles.leftSlot}>{left}</View>
-      {title ? <Text numberOfLines={1} style={styles.title}>{title}</Text> : null}
+    <View style={[styles.bar, { paddingTop: topInset + 6 }]}>
+      <View style={styles.leftSection}>
+        {left ? (
+          <View style={styles.leftSlot}>{left}</View>
+        ) : !hideIcon ? (
+          <SelahAppIconSvg size={22} color={theme.primary} />
+        ) : null}
+        {title ? <Text numberOfLines={1} style={styles.title}>{title}</Text> : null}
+      </View>
       <View style={styles.rightSlot}>
         {right}
         <Pressable
@@ -43,31 +61,38 @@ export default function AppHeader({ left, right, title }: AppHeaderProps) {
 function makeStyles(theme: AppTheme) {
   return StyleSheet.create({
     bar: {
-      height: 44,
+      minHeight: 44,
       flexDirection: 'row',
       alignItems: 'center',
+      justifyContent: 'space-between',
       gap: 8,
-      paddingHorizontal: 10,
+      paddingHorizontal: 14,
+      paddingBottom: 10,
       backgroundColor: theme.surface,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
     },
+    leftSection: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+    },
     leftSlot: {
       flexDirection: 'row',
       alignItems: 'center',
-      minWidth: 40,
-      flexShrink: 1,
     },
     title: {
       flex: 1,
       color: theme.text,
-      fontSize: 15,
-      fontWeight: '700',
+      fontSize: 20,
+      fontWeight: '800',
     },
     rightSlot: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: 6,
+      flexShrink: 0,
     },
     toggleButton: {
       width: 34,

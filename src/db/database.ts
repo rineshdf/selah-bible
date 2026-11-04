@@ -308,9 +308,20 @@ const SCHEMA = `
     book_id INTEGER NOT NULL,
     chapter INTEGER NOT NULL,
     read_date TEXT NOT NULL,
+    is_read INTEGER DEFAULT 1,
+    read_at TEXT,
     PRIMARY KEY (book_id, chapter)
   );
   CREATE INDEX IF NOT EXISTS idx_reading_progress_date ON reading_progress (read_date);
+
+  CREATE TABLE IF NOT EXISTS verse_read_progress (
+    book_id INTEGER NOT NULL,
+    chapter INTEGER NOT NULL,
+    verse INTEGER NOT NULL,
+    read_at TEXT NOT NULL,
+    PRIMARY KEY (book_id, chapter, verse)
+  );
+  CREATE INDEX IF NOT EXISTS idx_verse_read_progress_book_ch ON verse_read_progress (book_id, chapter);
 
   CREATE TABLE IF NOT EXISTS reading_progress_v2 (
     version_id TEXT NOT NULL DEFAULT 'TAMIL_BSI',
@@ -340,6 +351,7 @@ export function initDatabase(): void {
   migrateColumns();
   migrateVerseReadColumns();
   migrateReadingProgressToVersioned();
+  migrateCanonicalReadingProgress();
 
   const versionRow = db.getFirstSync<{ user_version: number }>('PRAGMA user_version;');
   if (versionRow && versionRow.user_version >= DATABASE_VERSION) {
@@ -364,6 +376,9 @@ function migrateColumns(): void {
   ensureColumn('reading_progress_v2', 'read_verses', 'TEXT');
   ensureColumn('reading_progress_v2', 'total_verses', 'INTEGER');
   ensureColumn('reading_progress_v2', 'is_read', 'INTEGER DEFAULT 0');
+  // Canonical reading_progress columns.
+  ensureColumn('reading_progress', 'is_read', 'INTEGER DEFAULT 1');
+  ensureColumn('reading_progress', 'read_at', 'TEXT');
 }
 
 /**
@@ -400,6 +415,22 @@ function migrateReadingProgressToVersioned(): void {
     `INSERT OR IGNORE INTO reading_progress_v2 (version_id, book_id, chapter, read_date)
      SELECT '${DEFAULT_PROGRESS_VERSION}', book_id, chapter, read_date FROM reading_progress;`,
   );
+}
+
+/**
+ * Sync complete chapters from reading_progress_v2 into canonical reading_progress
+ * and verse_read_progress so existing progress is seamlessly unified.
+ */
+function migrateCanonicalReadingProgress(): void {
+  try {
+    db.runSync(`
+      INSERT OR IGNORE INTO reading_progress (book_id, chapter, read_date, is_read, read_at)
+      SELECT book_id, chapter, read_date, 1, read_date FROM reading_progress_v2
+      WHERE is_read = 1 OR (total_verses > 0 AND total_verses IS NOT NULL AND length(read_verses) > 2);
+    `);
+  } catch {
+    // Table may be empty or unmigrated; non-fatal
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +806,52 @@ export function deletePrayerPoint(id: number): void {
 // reading_progress (per-version, v2 table; legacy rows keep 'TAMIL_BSI')
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Cross-screen progress change notification
+// ---------------------------------------------------------------------------
+
+/**
+ * Lightweight fan-out: any screen that writes reading progress (the Home
+ * reader) notifies mounted screens (the Progress tab) so their percentages
+ * and counts refresh without a tab switch. Listeners run synchronously but
+ * must only trigger async work / setState — never throw.
+ */
+type ProgressListener = () => void;
+const progressListeners = new Set<ProgressListener>();
+
+/** Subscribe to progress writes. Returns an unsubscribe function. */
+export function onProgressUpdated(listener: ProgressListener): () => void {
+  progressListeners.add(listener);
+  return () => progressListeners.delete(listener);
+}
+
+/** Fan out to every subscriber; a throwing listener never breaks a write. */
+export function notifyProgressUpdated(): void {
+  for (const listener of progressListeners) {
+    try {
+      listener();
+    } catch {
+      // Swallow listener errors so a progress write can never fail because of a consumer.
+    }
+  }
+}
+
+function indexAdd(bookId: number, chapter: number): void {
+  let set = readChapterIndex.get(bookId);
+  if (!set) {
+    set = new Set<number>();
+    readChapterIndex.set(bookId, set);
+  }
+  set.add(chapter);
+}
+
+function indexRemove(bookId: number, chapter: number): void {
+  const set = readChapterIndex.get(bookId);
+  if (!set) return;
+  set.delete(chapter);
+  if (set.size === 0) readChapterIndex.delete(bookId);
+}
+
 export function markChapterRead(
   bookId: number,
   chapter: number,
@@ -786,6 +863,8 @@ export function markChapterRead(
      ON CONFLICT (version_id, book_id, chapter) DO UPDATE SET read_date = excluded.read_date;`,
     [versionId, bookId, chapter, readDate ?? isoDate()],
   );
+  indexAdd(bookId, chapter);
+  notifyProgressUpdated();
 }
 
 export function unmarkChapterRead(
@@ -797,6 +876,8 @@ export function unmarkChapterRead(
     'DELETE FROM reading_progress_v2 WHERE version_id = ? AND book_id = ? AND chapter = ?;',
     [versionId, bookId, chapter],
   );
+  indexRemove(bookId, chapter);
+  notifyProgressUpdated();
 }
 
 /** The day a chapter was last marked read, or null when never read. */
@@ -822,19 +903,67 @@ export function getBookReadingProgress(
   );
 }
 
-/** Reading history for one version (metadata rows shaped like the legacy ones). */
+/** Reading history across versions and canonical progress (metadata rows shaped like the legacy ones). */
 export function getAllReadingProgress(
   versionId: string = DEFAULT_PROGRESS_VERSION,
 ): ReadingProgressRow[] {
   return db.getAllSync<ReadingProgressRow>(
-    `SELECT book_id, chapter, read_date FROM reading_progress_v2
-     WHERE version_id = ? ORDER BY read_date DESC, book_id, chapter;`,
-    [versionId],
+    `SELECT DISTINCT book_id, chapter, read_date FROM (
+       SELECT book_id, chapter, read_date FROM reading_progress WHERE read_date IS NOT NULL
+       UNION ALL
+       SELECT book_id, chapter, read_date FROM reading_progress_v2 WHERE read_date IS NOT NULL
+     ) ORDER BY read_date DESC, book_id, chapter;`,
   );
 }
 
 // ---------------------------------------------------------------------------
-// Verse-level mark-read tracking (v5)
+// In-memory read-chapter index (O(1) lookups)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-book set of read chapter numbers for the currently tracked version.
+ * Kept in sync with the database on every write so membership checks and
+ * read counts are O(1) instead of a full-table scan.
+ */
+const readChapterIndex = new Map<number, Set<number>>();
+
+/**
+ * (Re)build the in-memory index from the database for one version.
+ * Call once when a version starts being tracked.
+ */
+export function rebuildReadChapterIndex(
+  versionId: string = DEFAULT_PROGRESS_VERSION,
+): void {
+  readChapterIndex.clear();
+  const rows = db.getAllSync<{ book_id: number; chapter: number }>(
+    `SELECT DISTINCT book_id, chapter FROM reading_progress_v2
+     WHERE version_id = ? AND (is_read = 1 OR read_date IS NOT NULL)
+     UNION
+     SELECT book_id, chapter FROM reading_progress WHERE is_read = 1 OR read_date IS NOT NULL;`,
+    [versionId],
+  );
+  for (const row of rows) {
+    let set = readChapterIndex.get(row.book_id);
+    if (!set) {
+      set = new Set<number>();
+      readChapterIndex.set(row.book_id, set);
+    }
+    set.add(row.chapter);
+  }
+}
+
+/** Number of chapters marked read for a book — O(1) via the in-memory index. */
+export function getReadChapterCount(bookId: number): number {
+  return readChapterIndex.get(bookId)?.size ?? 0;
+}
+
+/** Whether a chapter is marked read — O(1) via the in-memory index. */
+export function isChapterIndexedAsRead(bookId: number, chapter: number): boolean {
+  return readChapterIndex.get(bookId)?.has(chapter) ?? false;
+}
+
+// ---------------------------------------------------------------------------
+// Verse-level mark-read tracking (v5) & Canonical Progress Sync
 // ---------------------------------------------------------------------------
 
 function parseReadVerses(raw: string | null): number[] {
@@ -863,28 +992,46 @@ function readVersesRow(
 }
 
 /**
- * Read state of one chapter for one version: the distinct verses marked read
- * plus whether the chapter counts as fully read (every verse read, or the
- * chapter was marked read as a whole before verse-level tracking existed).
+ * Read state of one chapter: checks canonical `reading_progress` and
+ * `verse_read_progress` as well as the active version row in `reading_progress_v2`.
  */
 export async function getChapterReadState(
   versionId: string,
   bookId: number,
   chapter: number,
 ): Promise<ChapterReadState> {
+  // 1. Canonical reading_progress (full chapter read)
+  const canonical = db.getFirstSync<{ is_read: number | null; read_date: string | null }>(
+    'SELECT is_read, read_date FROM reading_progress WHERE book_id = ? AND chapter = ?;',
+    [bookId, chapter],
+  );
+
+  // 2. Canonical verse_read_progress (individual verses)
+  const canonicalVerseRows = db.getAllSync<{ verse: number }>(
+    'SELECT verse FROM verse_read_progress WHERE book_id = ? AND chapter = ? ORDER BY verse;',
+    [bookId, chapter],
+  );
+  const canonicalVerses = canonicalVerseRows.map((r) => r.verse);
+
+  // 3. Version row
   const row = readVersesRow(versionId, bookId, chapter);
-  if (!row) return { isChapterRead: false, readVerses: [] };
-  const readVerses = parseReadVerses(row.read_verses);
-  // Legacy full-chapter mark: no array recorded but the row exists.
-  if (readVerses.length === 0 && row.read_verses === null) {
-    return { isChapterRead: true, readVerses: [] };
-  }
-  const total = row.total_verses ?? 0;
-  const isChapterRead = row.is_read === 1 || (total > 0 && readVerses.length >= total);
-  return { isChapterRead, readVerses };
+  const v2Verses = parseReadVerses(row?.read_verses ?? null);
+  const mergedVerses = [...new Set([...canonicalVerses, ...v2Verses])].sort((a, b) => a - b);
+  const total = Math.max(row?.total_verses ?? 0, mergedVerses.length);
+
+  const isChapterRead =
+    (canonical && (canonical.is_read === 1 || Boolean(canonical.read_date))) ||
+    row?.is_read === 1 ||
+    (total > 0 && mergedVerses.length >= total) ||
+    (row && v2Verses.length === 0 && row.read_verses === null && Boolean(row.read_date));
+
+  return { isChapterRead: Boolean(isChapterRead), readVerses: mergedVerses };
 }
 
-/** Insert/refresh one chapter row with a raw verse set. */
+/**
+ * Unified recording: insert/refresh chapter and verse records across BOTH
+ * canonical `reading_progress` / `verse_read_progress` AND `reading_progress_v2`.
+ */
 function writeChapterReadState(
   versionId: string,
   bookId: number,
@@ -897,6 +1044,10 @@ function writeChapterReadState(
     readVerses.length,
   );
   const isRead = total > 0 && readVerses.length >= total ? 1 : 0;
+  const now = isoTimestamp();
+  const date = isoDate();
+
+  // 1. Update version-specific reading_progress_v2
   db.runSync(
     `INSERT INTO reading_progress_v2 (version_id, book_id, chapter, read_date, read_verses, total_verses, is_read)
      VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -908,14 +1059,44 @@ function writeChapterReadState(
          ELSE MAX(reading_progress_v2.total_verses, excluded.total_verses)
        END,
        is_read = excluded.is_read;`,
-    [versionId, bookId, chapter, isoDate(), JSON.stringify(readVerses), total, isRead],
+    [versionId, bookId, chapter, date, JSON.stringify(readVerses), total, isRead],
   );
+
+  // 2. Update canonical verse_read_progress
+  db.runSync('DELETE FROM verse_read_progress WHERE book_id = ? AND chapter = ?;', [bookId, chapter]);
+  for (const v of readVerses) {
+    db.runSync(
+      `INSERT INTO verse_read_progress (book_id, chapter, verse, read_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT (book_id, chapter, verse) DO UPDATE SET read_at = excluded.read_at;`,
+      [bookId, chapter, v, now],
+    );
+  }
+
+  // 3. Update canonical reading_progress
+  if (isRead === 1) {
+    db.runSync(
+      `INSERT INTO reading_progress (book_id, chapter, read_date, is_read, read_at)
+       VALUES (?, ?, ?, 1, ?)
+       ON CONFLICT (book_id, chapter) DO UPDATE SET
+         read_date = excluded.read_date,
+         is_read = 1,
+         read_at = excluded.read_at;`,
+      [bookId, chapter, date, now],
+    );
+    indexAdd(bookId, chapter);
+  } else {
+    db.runSync('DELETE FROM reading_progress WHERE book_id = ? AND chapter = ?;', [bookId, chapter]);
+    indexRemove(bookId, chapter);
+  }
+
+  notifyProgressUpdated();
 }
 
 /**
  * Mark the given verses read for one chapter (merging with any verses already
- * read). When the merged set covers every verse of the chapter the row flips
- * to a fully-read chapter, so the Progress tab percentage advances.
+ * read in canonical storage). When the merged set covers every verse of the
+ * chapter, the chapter flips to fully read and advances Reading Progress.
  */
 export async function markVersesRead(
   versionId: string,
@@ -929,13 +1110,17 @@ export async function markVersesRead(
   );
   if (valid.length === 0) return;
   const existing = parseReadVerses(readVersesRow(versionId, bookId, chapter)?.read_verses ?? null);
-  const merged = [...new Set([...existing, ...valid])].sort((a, b) => a - b);
+  const canonicalVerseRows = db.getAllSync<{ verse: number }>(
+    'SELECT verse FROM verse_read_progress WHERE book_id = ? AND chapter = ?;',
+    [bookId, chapter],
+  );
+  const canonicalVerses = canonicalVerseRows.map((r) => r.verse);
+  const merged = [...new Set([...existing, ...canonicalVerses, ...valid])].sort((a, b) => a - b);
   writeChapterReadState(versionId, bookId, chapter, merged, totalVersesInChapter);
 }
 
 /**
- * Unmark the given verses for one chapter. When nothing stays read the row
- * disappears entirely so the chapter counts as unread again.
+ * Unmark the given verses for one chapter across canonical tables.
  */
 export async function unmarkVersesRead(
   versionId: string,
@@ -944,14 +1129,32 @@ export async function unmarkVersesRead(
   verseNumbers: number[],
 ): Promise<void> {
   const existing = parseReadVerses(readVersesRow(versionId, bookId, chapter)?.read_verses ?? null);
-  if (existing.length === 0 && verseNumbers.length === 0) return;
+  const canonicalVerseRows = db.getAllSync<{ verse: number }>(
+    'SELECT verse FROM verse_read_progress WHERE book_id = ? AND chapter = ?;',
+    [bookId, chapter],
+  );
+  const canonicalVerses = canonicalVerseRows.map((r) => r.verse);
+  const allExisting = [...new Set([...existing, ...canonicalVerses])];
+
+  if (allExisting.length === 0 && verseNumbers.length === 0) return;
   const remove = new Set(verseNumbers.filter(Number.isInteger));
-  const remaining = existing.filter((verse) => !remove.has(verse));
+  const remaining = allExisting.filter((verse) => !remove.has(verse));
+
   if (remaining.length === 0) {
     db.runSync(
-      'DELETE FROM reading_progress_v2 WHERE version_id = ? AND book_id = ? AND chapter = ?;',
-      [versionId, bookId, chapter],
+      'DELETE FROM reading_progress_v2 WHERE book_id = ? AND chapter = ?;',
+      [bookId, chapter],
     );
+    db.runSync(
+      'DELETE FROM reading_progress WHERE book_id = ? AND chapter = ?;',
+      [bookId, chapter],
+    );
+    db.runSync(
+      'DELETE FROM verse_read_progress WHERE book_id = ? AND chapter = ?;',
+      [bookId, chapter],
+    );
+    indexRemove(bookId, chapter);
+    notifyProgressUpdated();
     return;
   }
   const row = readVersesRow(versionId, bookId, chapter);
@@ -966,9 +1169,8 @@ export async function unmarkVersesRead(
 
 /**
  * Flip the read state of an entire chapter:
- * - fully read  -> unmarked (row deleted) and the helper returns `false`;
- * - not fully read -> every verse 1..totalVersesInChapter marked read and
- *   the helper returns `true`.
+ * - fully read -> unmarked across canonical tables;
+ * - not fully read -> marked read across canonical tables.
  */
 export async function toggleChapterRead(
   versionId: string,
@@ -980,9 +1182,19 @@ export async function toggleChapterRead(
   const total = Math.max(Number.isFinite(totalVersesInChapter) ? totalVersesInChapter : 0, readVerses.length);
   if (isChapterRead || (total > 0 && readVerses.length >= total)) {
     db.runSync(
-      'DELETE FROM reading_progress_v2 WHERE version_id = ? AND book_id = ? AND chapter = ?;',
-      [versionId, bookId, chapter],
+      'DELETE FROM reading_progress_v2 WHERE book_id = ? AND chapter = ?;',
+      [bookId, chapter],
     );
+    db.runSync(
+      'DELETE FROM reading_progress WHERE book_id = ? AND chapter = ?;',
+      [bookId, chapter],
+    );
+    db.runSync(
+      'DELETE FROM verse_read_progress WHERE book_id = ? AND chapter = ?;',
+      [bookId, chapter],
+    );
+    indexRemove(bookId, chapter);
+    notifyProgressUpdated();
     return false;
   }
   const all = Array.from({ length: Math.max(total, 1) }, (_, index) => index + 1);
@@ -991,41 +1203,83 @@ export async function toggleChapterRead(
 }
 
 /**
- * Progress snapshot for one version: fully-read chapter numbers per book id
- * plus the count of individually read verses per partially-read book, so the
- * Progress tab reflects both complete chapters and verse chunks marked in
- * the reader.
+ * Canonical progress snapshot: computes fully-read chapters and partial-verse
+ * counts per book from `reading_progress`, `verse_read_progress`, and `reading_progress_v2`.
  */
 export async function getVersionProgressSummary(
-  versionId: string,
+  versionId: string = DEFAULT_PROGRESS_VERSION,
 ): Promise<Record<number, BookProgressSummary>> {
-  const rows = db.getAllSync<ReadingProgressV2Row>(
-    `SELECT version_id, book_id, chapter, read_date, read_verses, total_verses, is_read
-     FROM reading_progress_v2 WHERE version_id = ? ORDER BY book_id, chapter;`,
-    [versionId],
-  );
   const summary: Record<number, BookProgressSummary> = {};
-  for (const row of rows) {
-    const book = summary[row.book_id] ??
-      { readChapters: [], partialVerseCounts: {}, partialTotalVerseCounts: {} };
-    const readVerses = parseReadVerses(row.read_verses);
-    const total = row.total_verses ?? 0;
-    // Legacy full-chapter mark: no array recorded but the row exists.
-    const complete =
-      row.is_read === 1 ||
-      (total > 0 && readVerses.length >= total) ||
-      (readVerses.length === 0 && row.read_verses === null);
-    if (complete) {
-      if (!book.readChapters.includes(row.chapter)) book.readChapters.push(row.chapter);
-      delete book.partialVerseCounts[row.chapter];
-      delete book.partialTotalVerseCounts[row.chapter];
-    } else if (readVerses.length > 0) {
-      book.partialVerseCounts[row.chapter] = readVerses.length;
-      book.partialTotalVerseCounts[row.chapter] = total;
+
+  // 1. Read all canonical fully read chapters from reading_progress
+  const canonicalChapters = db.getAllSync<{ book_id: number; chapter: number }>(
+    'SELECT book_id, chapter FROM reading_progress WHERE is_read = 1 OR read_date IS NOT NULL;',
+  );
+  for (const row of canonicalChapters) {
+    const book = summary[row.book_id] ?? {
+      readChapters: [],
+      partialVerseCounts: {},
+      partialTotalVerseCounts: {},
+    };
+    if (!book.readChapters.includes(row.chapter)) {
+      book.readChapters.push(row.chapter);
     }
     summary[row.book_id] = book;
   }
-  for (const book of Object.values(summary)) book.readChapters.sort((a, b) => a - b);
+
+  // 2. Read canonical verse-level progress from verse_read_progress
+  const canonicalVerses = db.getAllSync<{ book_id: number; chapter: number; verse_count: number }>(
+    'SELECT book_id, chapter, COUNT(*) AS verse_count FROM verse_read_progress GROUP BY book_id, chapter;',
+  );
+  for (const row of canonicalVerses) {
+    const book = summary[row.book_id] ?? {
+      readChapters: [],
+      partialVerseCounts: {},
+      partialTotalVerseCounts: {},
+    };
+    if (!book.readChapters.includes(row.chapter)) {
+      book.partialVerseCounts[row.chapter] = row.verse_count;
+    }
+    summary[row.book_id] = book;
+  }
+
+  // 3. Merge reading_progress_v2
+  const rows = db.getAllSync<ReadingProgressV2Row>(
+    `SELECT version_id, book_id, chapter, read_date, read_verses, total_verses, is_read
+     FROM reading_progress_v2 ORDER BY book_id, chapter;`,
+  );
+  for (const row of rows) {
+    const book = summary[row.book_id] ?? {
+      readChapters: [],
+      partialVerseCounts: {},
+      partialTotalVerseCounts: {},
+    };
+    const readVerses = parseReadVerses(row.read_verses);
+    const total = row.total_verses ?? 0;
+    const complete =
+      row.is_read === 1 ||
+      (total > 0 && readVerses.length >= total) ||
+      (readVerses.length === 0 && row.read_verses === null && Boolean(row.read_date));
+
+    if (complete) {
+      if (!book.readChapters.includes(row.chapter)) {
+        book.readChapters.push(row.chapter);
+      }
+      delete book.partialVerseCounts[row.chapter];
+      delete book.partialTotalVerseCounts[row.chapter];
+    } else if (readVerses.length > 0 && !book.readChapters.includes(row.chapter)) {
+      const current = book.partialVerseCounts[row.chapter] ?? 0;
+      if (readVerses.length > current) {
+        book.partialVerseCounts[row.chapter] = readVerses.length;
+        book.partialTotalVerseCounts[row.chapter] = total;
+      }
+    }
+    summary[row.book_id] = book;
+  }
+
+  for (const book of Object.values(summary)) {
+    book.readChapters.sort((a, b) => a - b);
+  }
   return summary;
 }
 

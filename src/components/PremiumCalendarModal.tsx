@@ -113,6 +113,14 @@ function CalendarSheet({
 
   const marked = useMemo(() => new Set(markedDates), [markedDates]);
   const today = todayIsoDate();
+  const todayDate = isoToDate(today);
+  const todayYear = todayDate.getFullYear();
+  const todayMonth = todayDate.getMonth();
+
+  /** Local ISO comparison — any day after today is permanently disabled. */
+  const isFutureIso = useCallback((iso: string) => iso > today, [today]);
+  const isNextMonthBlocked = viewYear > todayYear ||
+    (viewYear === todayYear && viewMonth >= todayMonth);
 
   /** Blank leading cells + one cell per day, Monday-first. */
   const gridCells = useMemo(() => {
@@ -126,8 +134,17 @@ function CalendarSheet({
   }, [viewMonth, viewYear]);
 
   const shiftMonth = useCallback((delta: number) => {
+    // Never step into a month after the current month & year.
     setViewMonth((month) => {
       const next = month + delta;
+      const nextYear = next > 11 ? viewYear + 1 : next < 0 ? viewYear - 1 : viewYear;
+      const clampedNext = next > 11 ? 0 : next < 0 ? 11 : next;
+      if (
+        clampedNext > todayMonth ||
+        nextYear > todayYear
+      ) {
+        return month;
+      }
       if (next < 0) {
         setViewYear((year) => year - 1);
         return 11;
@@ -138,7 +155,7 @@ function CalendarSheet({
       }
       return next;
     });
-  }, []);
+  }, [todayMonth, todayYear, viewYear]);
 
   const handleGoToday = useCallback(() => {
     onSelectDate(today);
@@ -150,16 +167,18 @@ function CalendarSheet({
 
   const handlePick = useCallback(
     (iso: string) => {
+      if (iso > today) return; // future dates are not selectable
       onSelectDate(iso);
       onClose();
     },
-    [onClose, onSelectDate],
+    [onClose, onSelectDate, today],
   );
 
-  const years = useMemo(
-    () => Array.from({ length: YEARS_MAX - YEARS_MIN + 1 }, (_, index) => YEARS_MIN + index),
-    [],
-  );
+  /** Year list stops at the current year — no future years are listed. */
+  const years = useMemo(() => {
+    const max = Math.max(YEARS_MIN, Math.min(YEARS_MAX, todayYear));
+    return Array.from({ length: max - YEARS_MIN + 1 }, (_, index) => YEARS_MIN + index);
+  }, [todayYear]);
 
   return (
     <>
@@ -217,12 +236,20 @@ function CalendarSheet({
             </Pressable>
 
             <Pressable
-              style={styles.arrowButton}
+              style={[styles.arrowButton, isNextMonthBlocked ? styles.arrowButtonDisabled : null]}
               onPress={() => shiftMonth(1)}
+              disabled={isNextMonthBlocked}
               accessibilityRole="button"
               accessibilityLabel="Next month"
             >
-              <Text style={styles.arrowText}>›</Text>
+              <Text
+                style={[
+                  styles.arrowText,
+                  isNextMonthBlocked ? styles.arrowTextDisabled : null,
+                ]}
+              >
+                ›
+              </Text>
             </Pressable>
           </View>
 
@@ -231,14 +258,21 @@ function CalendarSheet({
             <View style={styles.monthPickerWrap}>
               {MONTH_NAMES.map((name, index) => {
                 const active = index === viewMonth;
+                const future = viewYear === todayYear && index > todayMonth;
                 return (
                   <Pressable
                     key={name}
-                    style={[styles.monthPickerCell, active ? styles.gridCellSelected : null]}
+                    style={[
+                      styles.monthPickerCell,
+                      active ? styles.gridCellSelected : null,
+                      future ? styles.pickerCellDisabled : null,
+                    ]}
                     onPress={() => {
+                      if (future) return;
                       setViewMonth(index);
                       setMonthPickerOpen(false);
                     }}
+                    disabled={future}
                     accessibilityRole="button"
                     accessibilityLabel={`Open ${name}`}
                   >
@@ -246,6 +280,7 @@ function CalendarSheet({
                       style={[
                         styles.monthPickerText,
                         active ? styles.gridCellTextSelected : null,
+                        future ? styles.gridCellTextDisabled : null,
                       ]}
                     >
                       {name.slice(0, 3)}
@@ -265,14 +300,21 @@ function CalendarSheet({
             >
               {years.map((year) => {
                 const active = year === viewYear;
+                const future = year > todayYear;
                 return (
                   <Pressable
                     key={year}
-                    style={[styles.yearCell, active ? styles.yearCellActive : null]}
+                    style={[
+                      styles.yearCell,
+                      active ? styles.yearCellActive : null,
+                      future ? styles.pickerCellDisabled : null,
+                    ]}
                     onPress={() => {
+                      if (future) return;
                       setViewYear(year);
                       setYearPickerOpen(false);
                     }}
+                    disabled={future}
                     accessibilityRole="button"
                     accessibilityLabel={`Jump to ${year}`}
                   >
@@ -280,6 +322,7 @@ function CalendarSheet({
                       style={[
                         styles.yearCellText,
                         active ? styles.gridCellTextSelected : null,
+                        future ? styles.gridCellTextDisabled : null,
                       ]}
                     >
                       {year}
@@ -300,24 +343,38 @@ function CalendarSheet({
                   iso === null ? (
                     <View key={`blank-${index}`} style={styles.gridCell} />
                   ) : (
-                    <Pressable
-                      key={iso}
-                      style={[styles.gridCell, iso === selectedDate ? styles.gridCellSelected : null]}
-                      onPress={() => handlePick(iso)}
-                      accessibilityRole="button"
-                      accessibilityLabel={`Select ${iso}`}
-                    >
-                      <Text
-                        style={[
-                          styles.gridCellText,
-                          iso === today ? styles.gridCellTextToday : null,
-                          iso === selectedDate ? styles.gridCellTextSelected : null,
-                        ]}
-                      >
-                        {Number(iso.slice(8, 10))}
-                      </Text>
-                      {marked.has(iso) ? <View style={styles.gridCellDot} /> : null}
-                    </Pressable>
+                    (() => {
+                      const future = isFutureIso(iso);
+                      return (
+                        <Pressable
+                          key={iso}
+                          style={[
+                            styles.gridCell,
+                            iso === selectedDate ? styles.gridCellSelected : null,
+                            future ? styles.gridCellDisabled : null,
+                          ]}
+                          onPress={() => handlePick(iso)}
+                          disabled={future}
+                          accessibilityRole="button"
+                          accessibilityState={{ disabled: future }}
+                          accessibilityLabel={
+                            future ? undefined : `Select ${iso}`
+                          }
+                        >
+                          <Text
+                            style={[
+                              styles.gridCellText,
+                              iso === today ? styles.gridCellTextToday : null,
+                              iso === selectedDate ? styles.gridCellTextSelected : null,
+                              future ? styles.gridCellTextDisabled : null,
+                            ]}
+                          >
+                            {Number(iso.slice(8, 10))}
+                          </Text>
+                          {marked.has(iso) ? <View style={styles.gridCellDot} /> : null}
+                        </Pressable>
+                      );
+                    })()
                   ),
                 )}
               </View>
@@ -488,6 +545,13 @@ function makeStyles(theme: AppTheme) {
       borderColor: theme.primary,
       borderWidth: 1,
     },
+    // Greyed-out future days: non-clickable, dimmed, muted text
+    gridCellDisabled: { opacity: 0.28 },
+    gridCellTextDisabled: { color: theme.textMuted },
+    arrowButtonDisabled: { opacity: 0.35 },
+    arrowTextDisabled: { color: theme.textMuted },
+    // Future months / years inside their picker grids
+    pickerCellDisabled: { opacity: 0.28 },
     gridCellText: {
       color: theme.text,
       fontSize: 14,

@@ -149,17 +149,114 @@ export function ProgressTrophySvg(props: SvgIconProps) {
 // ---------------------------------------------------------------------------
 
 export function CalendarSvg(props: SvgIconProps) {
+  const color = props.color ?? DEFAULT_COLOR;
   return (
-    <StrokeSvg {...props}>
-      <Rect x="3.5" y="5" width="17" height="15.5" rx="2" />
-      <Path d="M3.5 9.5h17" />
-      <Path d="M8 3v4M16 3v4" />
-      <Circle cx="7.75" cy="13" r="0.9" fill={props.color ?? DEFAULT_COLOR} strokeOpacity={0} />
-      <Circle cx="12" cy="13" r="0.9" fill={props.color ?? DEFAULT_COLOR} strokeOpacity={0} />
-      <Circle cx="16.25" cy="13" r="0.9" fill={props.color ?? DEFAULT_COLOR} strokeOpacity={0} />
-      <Circle cx="7.75" cy="16.75" r="0.9" fill={props.color ?? DEFAULT_COLOR} strokeOpacity={0} />
-      <Circle cx="12" cy="16.75" r="0.9" fill={props.color ?? DEFAULT_COLOR} strokeOpacity={0} />
-    </StrokeSvg>
+    <Svg width={props.size ?? 24} height={props.size ?? 24} viewBox="0 0 24 24" fill="none">
+      <Rect
+        x="3.5"
+        y="5"
+        width="17"
+        height="15.5"
+        rx="3"
+        stroke={color}
+        strokeWidth={2}
+        fill="none"
+      />
+      <Path
+        d="M8 3v4M16 3v4"
+        stroke={color}
+        strokeWidth={2}
+        strokeLinecap="round"
+      />
+      <Path
+        d="M3.5 10h17"
+        stroke={color}
+        strokeWidth={2}
+      />
+      <Circle cx="8.5" cy="14" r="1" fill={color} />
+      <Circle cx="12" cy="14" r="1" fill={color} />
+      <Circle cx="15.5" cy="14" r="1" fill={color} />
+      <Circle cx="8.5" cy="17.2" r="1" fill={color} />
+      <Circle cx="12" cy="17.2" r="1" fill={color} />
+      <Circle cx="15.5" cy="17.2" r="1" fill={color} />
+    </Svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ChevronLeftSvg — left navigation arrow
+// ---------------------------------------------------------------------------
+
+export function ChevronLeftSvg(props: SvgIconProps) {
+  const color = props.color ?? DEFAULT_COLOR;
+  return (
+    <Svg width={props.size ?? 24} height={props.size ?? 24} viewBox="0 0 24 24" fill="none">
+      <Path
+        d="M14.5 6L8.5 12L14.5 18"
+        stroke={color}
+        strokeWidth={2.4}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </Svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ChevronRightSvg — right navigation arrow
+// ---------------------------------------------------------------------------
+
+export function ChevronRightSvg(props: SvgIconProps) {
+  const color = props.color ?? DEFAULT_COLOR;
+  return (
+    <Svg width={props.size ?? 24} height={props.size ?? 24} viewBox="0 0 24 24" fill="none">
+      <Path
+        d="M9.5 6L15.5 12L9.5 18"
+        stroke={color}
+        strokeWidth={2.4}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </Svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RewindSvg — symmetrical circular rewind arrow with centered clock hands
+// ---------------------------------------------------------------------------
+
+export function RewindSvg(props: SvgIconProps) {
+  const color = props.color ?? DEFAULT_COLOR;
+  return (
+    <Svg width={props.size ?? 24} height={props.size ?? 24} viewBox="0 0 24 24" fill="none">
+      {/* Outer circular track (r = 8.5 centered at 12, 12) */}
+      <Path
+        d="M3.5 12a8.5 8.5 0 1 0 2.49-6.01L3.5 8.5"
+        stroke={color}
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+      {/* Symmetrical rewind chevron arrowhead at top-left */}
+      <Path
+        d="M3.5 4v4.5H8"
+        stroke={color}
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+      {/* Centered clock hands inside (12, 12) */}
+      <Path
+        d="M12 8v4l2.8 1.8"
+        stroke={color}
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    </Svg>
   );
 }
 
@@ -316,15 +413,18 @@ export function TabHighlightsSvg({ color, size = 24, focused = false }: TabIconP
   );
 }
 
-// TabMessagesSvg — sermon notebook with a binding edge and text lines
+// TabMessagesSvg — sermon notebook: rounded page card with three text lines
 
 export function TabMessagesSvg({ color, size = 24, focused = false }: TabIconProps) {
   return (
     <TabStrokeSvg color={color} size={size} focused={focused}>
-      <Rect x="6" y="3.5" width="13.5" height="17" rx="2" />
-      <Path d="M6 7h4.5M6 20.5V7" />
-      <Path d="M12.5 8.5h4.5M12.5 12h4.5M12.5 15.5h3" />
-      {focused ? <Path d="M8.5 12h.01" /> : null}
+      {/* Notebook page card. */}
+      <Rect x="5" y="3" width="14" height="18" rx="2.5" />
+      {/* Three text lines inside the card. */}
+      <Path d="M8.5 8H15.5" />
+      <Path d="M8.5 12H15.5" />
+      <Path d="M8.5 16H13" />
+      {focused ? <Path d="M8.5 3V21" /> : null}
     </TabStrokeSvg>
   );
 }
@@ -343,27 +443,40 @@ export function TabDailyWalkSvg({ color, size = 24, focused = false }: TabIconPr
   );
 }
 
-// TabProgressSvg — circular progress chart with a rising trend line
+// TabProgressSvg — clean circular progress ring with a centered checkmark.
+// Perfectly symmetrical on the 24x24 axis: the ring is a full circle centered
+// at (12, 12) and the checkmark is optically centered inside it — no trend
+// line, no off-axis arrowheads.
 
 export function TabProgressSvg({ color, size = 24, focused = false }: TabIconProps) {
   return (
     <TabStrokeSvg color={color} size={size} focused={focused}>
-      <Path d="M12 3.5a8.5 8.5 0 1 0 8.5 8.5" />
-      <Path d="M7.5 14.5l3-3 2 2 4-4" />
-      <Path d="M14.7 5.5h1.8v1.8" />
-      {focused ? <Path d="M20.5 12a8.5 8.5 0 0 0-.5-2.9" /> : null}
+      {/* Progress ring: full circle, symmetric around the center point. */}
+      <Circle cx="12" cy="12" r="8.75" />
+      {/* Focused accent: heavier clockwise-from-top arc (12 o'clock → 6). */}
+      {focused ? <Path d="M12 3.25a8.75 8.75 0 0 1 8.75 8.75" /> : null}
+      {/* Centered checkmark (spans 9→15 horizontally around cx 12). */}
+      <Path d="M9 12.5l2 2 4-4" />
     </TabStrokeSvg>
   );
 }
 
-// TabVersionsSvg — globe with a download arrow underneath
+// TabVersionsSvg — Bible library shelf: three upright book spines standing on
+// a horizontal shelf line, centered in the 24x24 grid.
 
 export function TabVersionsSvg({ color, size = 24, focused = false }: TabIconProps) {
   return (
     <TabStrokeSvg color={color} size={size} focused={focused}>
-      <Circle cx="12" cy="9.5" r="6" />
-      <Path d="M6 9.5h12M12 3.5c-2.1 1.7-2.1 10.3 0 12M12 3.5c2.1 1.7 2.1 10.3 0 12" />
-      <Path d="M12 17.5v4M10 19.7l2-2 2 2" />
+      {/* Horizontal shelf line the books stand on. */}
+      <Path d="M3 20.5H21" />
+      {/* Upright book spine 1 (left). */}
+      <Rect x="4.5" y="5" width="3.5" height="15.5" rx="1" />
+      {/* Upright book spine 2 (taller middle). */}
+      <Rect x="10" y="3.5" width="3.5" height="17" rx="1" />
+      {/* Upright book spine 3 (right). */}
+      <Rect x="15.5" y="5" width="3.5" height="15.5" rx="1" />
+      {/* Focused accent: title band across the middle spine. */}
+      {focused ? <Path d="M10.75 7.5H12.75" /> : null}
     </TabStrokeSvg>
   );
 }

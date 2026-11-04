@@ -28,11 +28,14 @@ import {
   ActivityIndicator,
   FlatList,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
+  useWindowDimensions,
 } from 'react-native';
 import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -41,12 +44,13 @@ import { useAppTheme } from '@/constants/ThemeContext';
 import { HIGHLIGHT_COLORS, getHighlightStyle, type AppTheme } from '@/constants/colors';
 import {
   BIBLE_BOOKS,
-  getBooksByTestament,
   getBookById,
   getLocalizedBookName,
   type BibleBook,
   type BookLanguageVersionMeta,
+  type VersionBookMeta,
 } from '@/constants/books';
+import { Svg, Path } from 'react-native-svg';
 import { ScalePressable } from '@/components/ScalePressable';
 import { SunMoonSvg } from '@/components/SvgIcons';
 import SelahAppIconSvg from '@/components/SelahAppIconSvg';
@@ -56,15 +60,17 @@ import {
   getActiveVersionId,
   getInstalledVersions,
   getVersionBookNames,
+  getVersionBooksById,
+  getVersionBooksManifest,
   isBundledVersionId,
   isTamilBsiDiskReady,
-  languageShortCode,
   loadChapterVerses,
   normalizeVersionId,
   setActiveVersionId,
   TAMIL_BSI_ID,
   type BibleVersionMeta,
   type ChapterVerse,
+  type VersionBookManifestEntry,
 } from '@/db/bibleLoader';
 import {
   addHighlight,
@@ -75,6 +81,7 @@ import {
   toggleChapterRead,
   unmarkVersesRead,
   updateHighlightColor,
+  notifyProgressUpdated,
   type ChapterReadState,
   type HighlightRow,
 } from '@/db/database';
@@ -85,6 +92,12 @@ const LAST_BOOK_ID = 66;
 const INITIAL_BOOK_ID = 1;
 const INITIAL_CHAPTER = 1;
 const CHAPTER_VIEWABILITY_CONFIG = { itemVisiblePercentThreshold: 30 };
+
+/** FIX 4 — one picker row: canonical book + the version's manifest entry. */
+type PickerBookItem = {
+  book: BibleBook;
+  manifest: VersionBookManifestEntry;
+};
 
 /** Device-local day, 'YYYY-MM-DD' (matches the DB date format). */
 function todayIsoDate(): string {
@@ -117,9 +130,28 @@ const NO_READ_STATE: ChapterReadState = { isChapterRead: false, readVerses: [] }
 
 export default function BibleReaderScreen() {
   const { theme, themeMode, toggleTheme } = useAppTheme();
-  const styles = makeStyles(theme);
+  const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
   const router = useRouter();
+
+  // FIX 1: dynamic 5-column chapter grid — tiles stretch exactly from the left
+  // content inset to the right content inset with zero wasted side space.
+  const { width: screenWidth } = useWindowDimensions();
+  const gridPadding = 16;
+  const gridGap = 10;
+  const gridCols = 5;
+  const tileWidth = Math.floor(
+    (screenWidth - gridPadding * 2 - gridGap * (gridCols - 1)) / gridCols,
+  );
+  // FIX 2 — exact pixel widths for Row 2: fixed Prev/Next sides plus two exact
+  // gaps guarantee the center pill can never push `Next >` off-screen.
+  const sideBtnWidth = 66;
+  const rowPadding = 12;
+  const rowGap = 8;
+  const centerPillWidth =
+    screenWidth - rowPadding * 2 - sideBtnWidth * 2 - rowGap * 2;
+  /** Modal headers sit just below the status bar with no dead black gap. */
+  const modalHeaderTop = Platform.OS === 'android' ? 8 : insets.top + 6;
 
   // -----------------------------------------------------------------------
   // Native first-launch setup: `bibles/TAMIL_BSI.json` is materialized from
@@ -170,26 +202,57 @@ export default function BibleReaderScreen() {
   const [bookId, setBookId] = useState(INITIAL_BOOK_ID);
   const [chapter, setChapter] = useState(INITIAL_CHAPTER);
   const [verses, setVerses] = useState<ChapterVerse[]>([]);
-  const [loading, setLoading] = useState(true);
+  /**
+   * FIX 3: dedicated chapter-load flag. It flips true the moment the reader's
+   * coordinates change and only flips false when verses (or a hard error)
+   * land, so the "Chapter unavailable" card can never flash mid-load or
+   * mid-redirect.
+   */
+  const [isLoadingChapter, setIsLoadingChapter] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [highlights, setHighlights] = useState<HighlightRow[]>([]);
   const [readState, setReadState] = useState<ChapterReadState>(NO_READ_STATE);
   /** First verse visible in the list — the live "reading position". */
   const [currentVisibleVerse, setCurrentVisibleVerse] = useState(1);
-  /** Highest verse the user has scrolled to / marked read in this chapter. */
-  const [chapterProgress, setChapterProgress] = useState(0);
   const [selectedVerses, setSelectedVerses] = useState<number[]>([]);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerStage, setPickerStage] = useState<'books' | 'chapters'>('books');
   const [pickerBook, setPickerBook] = useState<BibleBook | null>(null);
+  const [bookSearchQuery, setBookSearchQuery] = useState('');
   /** Bumped on every tab focus so returning from Bibles refreshes chapter data. */
   const [refreshTick, setRefreshTick] = useState(0);
   /** Quick version switcher (top-left pill): every version on this device. */
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [installedVersions, setInstalledVersions] = useState<BibleVersionMeta[]>([]);
 
-  const loadTokenRef = useRef(0);
+  /**
+   * FIX 3: request id for in-flight chapter loads. Each coordinate change
+   * bumps it; a stale response whose id no longer matches is dropped.
+   */
+  const loadRequestIdRef = useRef(0);
   const listRef = useRef<FlatList<ChapterVerse> | null>(null);
+  /**
+   * FIX 4 — the active version's real book manifest (canonical ids, the
+   * version's own native names, true chapter counts). `null` while loading;
+   * `[]` when the version has no readable local file. Pickers never fall back
+   * to the canonical 66-book fillers.
+   *
+   * Stored together with its version id so switching versions can never show
+   * the previous version's books for even one frame.
+   */
+  const [versionManifestState, setVersionManifestState] = useState<{
+    versionId: string;
+    books: VersionBookManifestEntry[];
+  } | null>(null);
+  const versionManifest = useMemo(
+    () => (versionManifestState &&
+      versionManifestState.versionId === normalizeVersionId(versionId)
+      ? versionManifestState.books
+      : null),
+    [versionId, versionManifestState],
+  );
+  /** Chapter count of the book open in the picker, from the manifest. */
+  const [pickerChapterCount, setPickerChapterCount] = useState(0);
 
   const currentBook = getBookById(bookId) ?? BIBLE_BOOKS[0];
 
@@ -219,17 +282,47 @@ export default function BibleReaderScreen() {
     };
   }, [versionId]);
 
+  /**
+   * Version books keyed by canonical id with USFM-derived native/common names.
+   * Feeds `getLocalizedBookName` so book names come from the version's own
+   * JSON even when the file's array order differs from the canonical grid.
+   */
+  const [versionBooksById, setVersionBooksById] = useState<Record<number, VersionBookMeta>>({});
+  useEffect(() => {
+    let cancelled = false;
+    void getVersionBooksById(versionId).then((lookup) => {
+      if (!cancelled) setVersionBooksById(lookup);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [versionId]);
+
+  // FIX 4 — load the version's true manifest. Only books the version
+  // actually carries come back (BTD → the four Gospels), with the version's
+  // own names and real chapter counts.
+  useEffect(() => {
+    let cancelled = false;
+    const normalized = normalizeVersionId(versionId);
+    void getVersionBooksManifest(normalized).then((manifest) => {
+      if (!cancelled) setVersionManifestState({ versionId: normalized, books: manifest });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [versionId]);
+
   /** Localized resolver for THIS active version (primary/secondary names). */
   const localizedBook = useCallback(
-    (id: number) => getLocalizedBookName(id, bookNamesMeta, customBookNames),
-    [bookNamesMeta, customBookNames],
+    (id: number) => getLocalizedBookName(id, bookNamesMeta, customBookNames, versionBooksById),
+    [bookNamesMeta, customBookNames, versionBooksById],
   );
 
   const activeBookNames = localizedBook(bookId);
   const primaryBookName = activeBookNames.primaryName;
   const secondaryBookName = activeBookNames.secondaryName;
 
-  /** Top-left pill: `[LANG] • [SHORT_NAME] ▾`, e.g. `TAM • BSI ▾`. */
+  /** Top-left pill: `{LanguageName} • {VersionShortName} ▾`, e.g. `Tamil • BSI ▾`. */
   const activeShortName = useMemo(() => {
     const id = normalizeVersionId(versionId);
     const meta = installedVersions.find((entry) => (entry.id ?? '') === id || entry.id === versionId);
@@ -237,8 +330,14 @@ export default function BibleReaderScreen() {
     if (isBundledVersionId(id)) return DEFAULT_TAMIL_BSI_META.shortName;
     return id;
   }, [installedVersions, versionId]);
-  const activeLanguageCode = languageShortCode(activeMeta);
-  const versionBadgeLabel = `${activeLanguageCode} • ${activeShortName}`;
+
+  const activeLanguageName = useMemo(() => {
+    const raw = activeMeta?.language || (isBundledVersionId(versionId) ? 'Tamil' : '');
+    const base = raw.split('(')[0]?.trim() || raw.trim();
+    return base.split(/\s+/)[0] || 'Tamil';
+  }, [activeMeta?.language, versionId]);
+
+  const versionBadgeLabel = `${activeLanguageName} • ${activeShortName} ▾`;
 
   // -----------------------------------------------------------------------
   // Jump support: the Highlights tab navigates here with jumpBook /
@@ -289,7 +388,7 @@ export default function BibleReaderScreen() {
   // Once the jumped-to chapter has loaded, scroll to the verse and open the
   // highlight bar over it.
   useEffect(() => {
-    if (pendingJumpVerse === null || loading || verses.length === 0) return;
+    if (pendingJumpVerse === null || isLoadingChapter || verses.length === 0) return;
     const timer = setTimeout(() => {
       const verseIndex = verses.findIndex((verse) => verse.verse === pendingJumpVerse);
       if (verseIndex >= 0) {
@@ -303,40 +402,75 @@ export default function BibleReaderScreen() {
       setPendingJumpVerse(null);
     }, 0);
     return () => clearTimeout(timer);
-  }, [pendingJumpVerse, loading, verses]);
+  }, [pendingJumpVerse, isLoadingChapter, verses]);
 
-  /** Load verses + per-chapter highlights/read state; token guards races. */
-  const refreshChapter = useCallback(async (vid: string, bid: number, chap: number) => {
-    const normalizedId = normalizeVersionId(vid);
-    const token = ++loadTokenRef.current;
-    // Yield before touching state so effect bodies never render cascade.
-    await Promise.resolve();
-    if (loadTokenRef.current !== token) return;
+  // -----------------------------------------------------------------------
+  // FIX 3: chapter loading driven by request ids, no stale-response races.
+  //
+  // Whenever version/book/chapter (or a focus-refresh tick) changes:
+  //   1. bump `loadRequestIdRef` and show the loading spinner immediately,
+  //   2. await `loadChapterVerses`,
+  //   3. drop the response entirely if a newer request started,
+  //   4. on redirect, commit verses + corrected book/chapter + spinner-off in
+  //      ONE state batch so the header pill (`Genesis 1` vs `Matthew 1`) and
+  //      the verse list never disagree on an intermediate render.
+  //
+  // The body runs in a 0ms timer so the effect never flips state
+  // synchronously (react-hooks/set-state-in-effect).
+  // -----------------------------------------------------------------------
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      const reqId = ++loadRequestIdRef.current;
 
-    setLoading(true);
-    setError(null);
-    setVerses([]);
-    setSelectedVerses([]);
-    setCurrentVisibleVerse(1);
-    setChapterProgress(0);
+      setIsLoadingChapter(true);
+      setError(null);
+      setSelectedVerses([]);
+      setCurrentVisibleVerse(1);
 
-    try {
-      const loaded = await loadChapterVerses(normalizedId, bid, chap);
-      if (loadTokenRef.current !== token) return;
-      setVerses(loaded);
-    } catch (err) {
-      if (loadTokenRef.current !== token) return;
-      setError(
-        err instanceof Error ? err.message : 'Could not load this chapter. Try another version.',
-      );
-    } finally {
-      if (loadTokenRef.current === token) setLoading(false);
-    }
+      void (async () => {
+        const normalizedId = normalizeVersionId(versionId);
+        try {
+          const result = await loadChapterVerses(normalizedId, bookId, chapter);
+          if (reqId !== loadRequestIdRef.current) return;
 
-    const numericId = numericVersionId(normalizedId);
-    setHighlights(getHighlightsForPassage(numericId, bid, chap));
-    setReadState(await getChapterReadState(normalizedId, bid, chap));
-  }, []);
+          if (result.actualBookId !== bookId || result.actualChapter !== chapter) {
+            // Partial version (NT-only, ...) redirect: atomic batch update.
+            setVerses(result.verses);
+            setBookId(result.actualBookId);
+            setChapter(result.actualChapter);
+            setIsLoadingChapter(false);
+          } else {
+            setVerses(result.verses);
+            setIsLoadingChapter(false);
+          }
+
+          const numericId = numericVersionId(normalizedId);
+          const chapterHighlights = getHighlightsForPassage(
+            numericId,
+            result.actualBookId,
+            result.actualChapter,
+          );
+          const nextReadState = await getChapterReadState(
+            normalizedId,
+            result.actualBookId,
+            result.actualChapter,
+          );
+          if (reqId !== loadRequestIdRef.current) return;
+          setHighlights(chapterHighlights);
+          setReadState(nextReadState);
+        } catch (err) {
+          if (reqId !== loadRequestIdRef.current) return;
+          setError(
+            err instanceof Error ? err.message : 'Could not load this chapter. Try another version.',
+          );
+          setHighlights([]);
+          setReadState(NO_READ_STATE);
+          setIsLoadingChapter(false);
+        }
+      })();
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [versionId, bookId, chapter, refreshTick]);
 
   // Restore the last reading position once on mount.
   useEffect(() => {
@@ -364,19 +498,13 @@ export default function BibleReaderScreen() {
     };
   }, []);
 
-  // Reload whenever the version, book, chapter changes or the tab refocuses.
-  // Deferred via timer so the effect body never flips state synchronously.
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      void refreshChapter(versionId, bookId, chapter);
-    }, 0);
-    return () => clearTimeout(timer);
-  }, [refreshChapter, versionId, bookId, chapter, refreshTick]);
-
   // Bibles tab may switch versions — pick that up on focus and refresh both
   // the reading version and the on-device version list for the switcher.
   useFocusEffect(
     useCallback(() => {
+      // Bumping the tick re-runs the chapter-load effect even when the
+      // coordinates are unchanged (the Bibles tab may have re-downloaded the
+      // same chapter).
       setRefreshTick((tick) => tick + 1);
       void getActiveVersionId().then((id) => {
         setVersionId((previous) => (previous === id ? previous : id));
@@ -387,15 +515,37 @@ export default function BibleReaderScreen() {
     }, []),
   );
 
-  /** Quick-switch to another on-device version from the top-left pill. */
+  /** Quick-switch to another on-device version from the top-left pill.
+   *
+   * FIX 3 — the switch is SYNCHRONOUS on the very first tap: any in-flight
+   * load for the old version is invalidated (`loadRequestIdRef` bump), the
+   * old chapter/selection is cleared immediately, the new id is committed to
+   * state before returning, and persistence happens fire-and-forget in the
+   * background. The chapter-load effect then runs with the NEW version id in
+   * its closure, so `loadChapterVerses` is always called with the tapped
+   * version — never a stale Tamil-BSI closure — and no repeat-tap is needed.
+   */
   const handleSwitchVersion = useCallback(
     (meta: BibleVersionMeta) => {
       setSwitcherOpen(false);
-      void setActiveVersionId(meta.id).then(() => {
-        setVersionId(normalizeVersionId(meta.id));
-      });
+      const newVersionId = normalizeVersionId(meta.id);
+      const activeId = normalizeVersionId(versionId);
+      // Same version tapped again: nothing to reload — keep the open chapter.
+      if (newVersionId === activeId) return;
+      loadRequestIdRef.current += 1;
+      setVerses([]);
+      setSelectedVerses([]);
+      setHighlights([]);
+      setReadState(NO_READ_STATE);
+      setCurrentVisibleVerse(1);
+      setError(null);
+      setIsLoadingChapter(true);
+      setVersionId(newVersionId);
+      listRef.current?.scrollToOffset({ offset: 0, animated: false });
+      void setActiveVersionId(newVersionId).catch(() => undefined);
+      void AsyncStorage.setItem('@progress_selected_version', newVersionId).catch(() => undefined);
     },
-    [],
+    [versionId],
   );
 
   // Persist the reading position so the app reopens where the user left off.
@@ -411,38 +561,122 @@ export default function BibleReaderScreen() {
     listRef.current?.scrollToOffset({ offset: 0, animated: false });
   }, [bookId, chapter, versionId]);
 
-  const canGoPrevious = bookId > FIRST_BOOK_ID || chapter > 1;
-  const canGoNext = bookId < LAST_BOOK_ID || chapter < currentBook.chaptersCount;
+  /**
+   * FIX 4 — the current book's chapter count comes from the ACTIVE version's
+   * manifest when it is known (BTD John = 21, not a canonical filler), so the
+   * reader's Next/Prev edges line up with the text that version really has.
+   */
+  const currentChapterCount = useMemo(() => {
+    const entry = versionManifest?.find((item) => item.bookId === bookId);
+    return entry && entry.chapters > 0 ? entry.chapters : currentBook.chaptersCount;
+  }, [bookId, currentBook.chaptersCount, versionManifest]);
+
+  /** Neighbour books INSIDE the version's manifest (skips books it lacks). */
+  const manifestNeighbours = useMemo(() => {
+    if (!versionManifest || versionManifest.length === 0) return { previous: null, next: null };
+    const index = versionManifest.findIndex((item) => item.bookId === bookId);
+    return {
+      previous: index > 0 ? versionManifest[index - 1] : null,
+      next: index >= 0 && index < versionManifest.length - 1 ? versionManifest[index + 1] : null,
+    };
+  }, [bookId, versionManifest]);
+
+  const canGoPrevious = chapter > 1 ||
+    Boolean(manifestNeighbours.previous) ||
+    (versionManifest === null && bookId > FIRST_BOOK_ID);
+  const canGoNext = chapter < currentChapterCount ||
+    Boolean(manifestNeighbours.next) ||
+    (versionManifest === null && bookId < LAST_BOOK_ID);
 
   const goToPreviousChapter = useCallback(() => {
     if (chapter > 1) {
       setChapter(chapter - 1);
       return;
     }
+    const previous = manifestNeighbours.previous;
+    if (previous) {
+      setBookId(previous.bookId);
+      setChapter(Math.max(1, previous.chapters));
+      return;
+    }
     const previousBook = getBookById(bookId - 1);
-    if (previousBook) {
+    if (previousBook && versionManifest === null) {
       setBookId(previousBook.id);
       setChapter(previousBook.chaptersCount);
     }
-  }, [bookId, chapter]);
+  }, [bookId, chapter, manifestNeighbours.previous, versionManifest]);
 
   const goToNextChapter = useCallback(() => {
-    if (chapter < currentBook.chaptersCount) {
+    if (chapter < currentChapterCount) {
       setChapter(chapter + 1);
       return;
     }
+    const next = manifestNeighbours.next;
+    if (next) {
+      setBookId(next.bookId);
+      setChapter(1);
+      return;
+    }
     const nextBook = getBookById(bookId + 1);
-    if (nextBook) {
+    if (nextBook && versionManifest === null) {
       setBookId(nextBook.id);
       setChapter(1);
     }
-  }, [bookId, chapter, currentBook]);
+  }, [bookId, chapter, currentChapterCount, manifestNeighbours.next, versionManifest]);
+
+  /** Picker rows: canonical book object paired with the manifest entry. */
+  const pickerBooks = useMemo<PickerBookItem[]>(() => {
+    if (!versionManifest) return [];
+    const items: PickerBookItem[] = [];
+    versionManifest.forEach((manifest) => {
+      const book = getBookById(manifest.bookId);
+      if (book) items.push({ book, manifest });
+    });
+    return items;
+  }, [versionManifest]);
 
   const openPicker = useCallback(() => {
     setPickerBook(currentBook);
-    setPickerStage('chapters');
+    const entry = versionManifest?.find((item) => item.bookId === currentBook.id);
+    const chapterCount = entry?.chapters ?? 0;
+    // FIX 4 — open on the chapter grid, but never on an empty one: if the
+    // manifest is still loading (or the current book is not in this version)
+    // start on the version's own book list instead.
+    setPickerChapterCount(chapterCount);
+    setPickerStage(chapterCount > 0 ? 'chapters' : 'books');
+    setBookSearchQuery('');
     setPickerOpen(true);
-  }, [currentBook]);
+  }, [currentBook, versionManifest]);
+
+  const filteredBooks = useMemo(() => {
+    const q = bookSearchQuery.trim().toLowerCase();
+    if (!q) return null;
+    return pickerBooks.filter(({ book, manifest }) => {
+      const names = localizedBook(book.id);
+      return (
+        names.primaryName.toLowerCase().includes(q) ||
+        names.secondaryName.toLowerCase().includes(q) ||
+        manifest.nativeName.toLowerCase().includes(q) ||
+        manifest.englishName.toLowerCase().includes(q) ||
+        book.englishName.toLowerCase().includes(q) ||
+        book.shortEnglishName?.toLowerCase().includes(q)
+      );
+    });
+  }, [bookSearchQuery, localizedBook, pickerBooks]);
+
+  /**
+   * FIX 4 — strict testament split driven by the manifest itself. A version
+   * with only Gospels renders NO Old Testament section, and the UI never
+   * paints 66 English fillers for a version that carries four books.
+   */
+  const oldTestamentBooks = useMemo(
+    () => pickerBooks.filter((item) => item.manifest.testament === 'OT'),
+    [pickerBooks],
+  );
+  const newTestamentBooks = useMemo(
+    () => pickerBooks.filter((item) => item.manifest.testament === 'NT'),
+    [pickerBooks],
+  );
 
   const selectChapter = useCallback((selectedBookId: number, selectedChapter: number) => {
     setPickerOpen(false);
@@ -499,46 +733,31 @@ export default function BibleReaderScreen() {
     setSelectedVerses([]);
   }, [bookId, chapter, currentBook, highlights, selectedVerses, versionId, verses]);
 
-  const handleRemoveHighlight = useCallback(() => {
-    if (selectedVerses.length === 0) return;
-    const selected = new Set(selectedVerses);
-    for (const highlight of highlights) {
-      if (selected.has(highlight.verse)) deleteHighlight(highlight.id);
-    }
-    setHighlights((previous) => previous.filter((row) => !selected.has(row.verse)));
-    setSelectedVerses([]);
-  }, [highlights, selectedVerses]);
-
   // --- Verse-level Mark-Read state machine --------------------------------
 
   const totalVerses = verses.length;
   const { isChapterRead, readVerses } = readState;
 
-  /** Live chapter progress: max(first visible verse, verses marked read). */
+  /** Static chapter read completion progress: 100% if marked read, or proportion of read verses. Never changes on scroll. */
   const progressPercent = useMemo(() => {
+    if (isChapterRead) return 100;
     if (totalVerses === 0) return 0;
-    const farthest = Math.max(chapterProgress, readVerses.length);
-    return Math.min((farthest / totalVerses) * 100, 100);
-  }, [chapterProgress, readVerses.length, totalVerses]);
+    return Math.min((readVerses.length / totalVerses) * 100, 100);
+  }, [isChapterRead, readVerses.length, totalVerses]);
 
-  /** Label + state shown by the top-right read pill and the selection bar. */
-  const { markReadLabel, markReadHandled } = useMemo(() => {
+  /** Label shown by the top-right read pill (concise, overflow-safe). */
+  const markReadLabel = useMemo(() => {
     if (selectedVerses.length === 0) {
-      return { markReadLabel: isChapterRead ? '✓ Read' : 'Mark Read', markReadHandled: isChapterRead };
+      return isChapterRead ? '✓ Read' : 'Mark Read';
     }
     const alreadyReadCount = selectedVerses.filter((verse) => readVerses.includes(verse)).length;
     if (selectedVerses.length === 1) {
-      const target = selectedVerses[0];
-      const isRead = readVerses.includes(target);
-      return { markReadLabel: isRead ? '✓ Read' : 'Mark Read', markReadHandled: isRead };
+      return readVerses.includes(selectedVerses[0]) ? '✓ Read' : 'Mark Read';
     }
     if (alreadyReadCount === selectedVerses.length) {
-      return { markReadLabel: '✓ Read', markReadHandled: true };
+      return '✓ Read';
     }
-    if (alreadyReadCount === 0) {
-      return { markReadLabel: `Mark Read (${selectedVerses.length})`, markReadHandled: false };
-    }
-    return { markReadLabel: 'Mark Read All Selected', markReadHandled: false };
+    return `Mark Read (${selectedVerses.length})`;
   }, [isChapterRead, readVerses, selectedVerses]);
 
   /** Re-read the persisted verse state after any write. */
@@ -553,10 +772,10 @@ export default function BibleReaderScreen() {
 
       // Whole chapter (nothing selected): toggle the chapter itself.
       if (selectedVerses.length === 0) {
-        const next = await toggleChapterRead(normalizedId, bookId, chapter, totalVerses);
+        await toggleChapterRead(normalizedId, bookId, chapter, totalVerses);
         setSelectedVerses([]);
         await reloadReadState();
-        if (next) setChapterProgress(totalVerses);
+        notifyProgressUpdated();
         return;
       }
 
@@ -568,21 +787,20 @@ export default function BibleReaderScreen() {
         await unmarkVersesRead(normalizedId, bookId, chapter, targets);
         await reloadReadState();
         setSelectedVerses([]);
+        notifyProgressUpdated();
         return;
       }
 
       await markVersesRead(normalizedId, bookId, chapter, targets, totalVerses);
       await reloadReadState();
-      const farthest = targets[targets.length - 1] ?? 0;
-      setChapterProgress((previous) => Math.max(previous, farthest));
       setSelectedVerses([]);
+      notifyProgressUpdated();
     })();
   }, [bookId, chapter, readVerses, reloadReadState, selectedVerses, totalVerses, versionId]);
 
   // --- Scroll tracking ------------------------------------------------------
 
-  /** Stable viewability callback — dependency-free useCallback so the
-   *  FlatList prop stays constant across renders (state setters are stable). */
+  /** Stable viewability callback for current visible verse indicator. */
   const viewableItemsHandler = useCallback(
     ({ viewableItems }: { viewableItems: { item: ChapterVerse }[] }) => {
       const visibleVerses = viewableItems
@@ -591,7 +809,6 @@ export default function BibleReaderScreen() {
       if (visibleVerses.length === 0) return;
       const first = Math.min(...visibleVerses);
       setCurrentVisibleVerse(first);
-      setChapterProgress((previous) => Math.max(previous, first));
     },
     [],
   );
@@ -619,33 +836,44 @@ export default function BibleReaderScreen() {
     [findVerseHighlight, getVerseRead, selectedVerses, styles, theme.isDark, toggleVerseSelection],
   );
 
+  /** Stable row key so FlatList reconciles verse rows without remounting. */
+  const verseKey = useCallback((item: ChapterVerse) => String(item.verse), []);
+
   return (
-    <View style={[styles.screen, { backgroundColor: theme.background, paddingTop: insets.top }]}>
-      {/* Row 1 — Top Header: language+version pill (left) · read status + theme toggle (right) */}
-      <View style={styles.headerRow}>
-        <View style={styles.headerLeft}>
-          <ScalePressable
-            style={styles.versionBadge}
-            onPress={() => setSwitcherOpen(true)}
-            onLongPress={() => router.navigate('/bibles')}
-            accessibilityRole="button"
-            accessibilityLabel={`Reading ${versionBadgeLabel}. Change Bible version`}
+    <View style={[styles.screen, { backgroundColor: theme.background }]}>
+      {/* Row 1 — Top Header: language+version pill (left) · read status + theme toggle (right).
+          The version pill is STATIC: identical text whether or not verses are
+          selected, single-line with tail ellipsis, fixed 40px height. */}
+      <View style={[styles.headerRow, { paddingTop: insets.top + 6 }]}>
+        <ScalePressable
+          style={[styles.versionBadge, { maxWidth: Math.floor(screenWidth * 0.55) }]}
+          onPress={() => setSwitcherOpen(true)}
+          onLongPress={() => router.navigate('/bibles')}
+          android_ripple={null}
+          accessibilityRole="button"
+          accessibilityLabel={`Reading ${versionBadgeLabel}. Change Bible version`}
+        >
+          <SelahAppIconSvg size={18} color={theme.primary} />
+          {/* FIX 2 — one single-line Text directly inside the row. No nested,
+              un-sized View that can collapse to 0px on Android. */}
+          <Text
+            numberOfLines={1}
+            ellipsizeMode="tail"
+            style={styles.versionBadgeText}
           >
-            <SelahAppIconSvg size={18} color={theme.primary} />
-            <Text numberOfLines={1} style={styles.versionBadgeText}>
-              {versionBadgeLabel}
-            </Text>
-            <Text style={styles.versionBadgeCaret}>▾</Text>
-          </ScalePressable>
-        </View>
+            {versionBadgeLabel}
+          </Text>
+        </ScalePressable>
         <View style={styles.headerRightControls}>
           <ScalePressable
             style={[styles.readChip, markReadLabel === '✓ Read' ? styles.readChipDone : null]}
             onPress={handleMarkReadPress}
+            android_ripple={null}
             accessibilityRole="button"
             accessibilityLabel={markReadLabel === '✓ Read' ? 'Mark as unread' : 'Mark as read'}
           >
             <Text
+              numberOfLines={1}
               style={[
                 styles.readChipText,
                 markReadLabel === '✓ Read' ? styles.readChipTextDone : null,
@@ -657,6 +885,7 @@ export default function BibleReaderScreen() {
           <ScalePressable
             style={styles.themeToggle}
             onPress={toggleTheme}
+            android_ripple={null}
             accessibilityRole="button"
             accessibilityLabel="Toggle dark or light theme"
           >
@@ -665,29 +894,44 @@ export default function BibleReaderScreen() {
         </View>
       </View>
 
-      {/* Row 2 — Chapter Navigation Bar: prev · live book/chapter/verse · next */}
+      {/* Row 2 — Chapter Navigation Bar: `< Prev` · live selector · `Next >` */}
       <View style={styles.chapterNavBar}>
         <ScalePressable
           style={[styles.navButton, !canGoPrevious && styles.navButtonDisabled]}
           onPress={goToPreviousChapter}
           disabled={!canGoPrevious}
+          android_ripple={null}
           accessibilityRole="button"
           accessibilityLabel="Previous chapter"
         >
-          <Text style={styles.navButtonGlyph}>{'‹'}</Text>
-          <Text style={styles.navButtonLabel}>Prev</Text>
+          <Text
+            numberOfLines={1}
+            ellipsizeMode="tail"
+            style={styles.navButtonLabel}
+          >
+            {'< Prev'}
+          </Text>
         </ScalePressable>
         <ScalePressable
-          style={styles.selectorButton}
+          style={[styles.selectorButton, { width: centerPillWidth, maxWidth: centerPillWidth }]}
           onPress={openPicker}
+          android_ripple={null}
           accessibilityRole="button"
           accessibilityLabel="Choose book and chapter"
         >
-          <Text numberOfLines={1} style={styles.selectorText}>
+          <Text
+            numberOfLines={1}
+            ellipsizeMode="tail"
+            style={[styles.selectorText, { width: centerPillWidth - 20 }]}
+          >
             {primaryBookName} {chapter}:{Math.min(currentVisibleVerse, Math.max(totalVerses, 1))}{' '}
             <Text style={styles.selectorCaret}>▾</Text>
           </Text>
-          <Text numberOfLines={1} style={styles.selectorSubText}>
+          <Text
+            numberOfLines={1}
+            ellipsizeMode="tail"
+            style={[styles.selectorSubText, { width: centerPillWidth - 20 }]}
+          >
             {totalVerses > 0
               ? `Verse ${Math.min(currentVisibleVerse, totalVerses)} of ${totalVerses}${
                   secondaryBookName ? ` · ${secondaryBookName}` : ''
@@ -699,11 +943,17 @@ export default function BibleReaderScreen() {
           style={[styles.navButton, !canGoNext && styles.navButtonDisabled]}
           onPress={goToNextChapter}
           disabled={!canGoNext}
+          android_ripple={null}
           accessibilityRole="button"
           accessibilityLabel="Next chapter"
         >
-          <Text style={styles.navButtonGlyph}>{'›'}</Text>
-          <Text style={styles.navButtonLabel}>Next</Text>
+          <Text
+            numberOfLines={1}
+            ellipsizeMode="tail"
+            style={styles.navButtonLabel}
+          >
+            {'Next >'}
+          </Text>
         </ScalePressable>
       </View>
 
@@ -717,17 +967,20 @@ export default function BibleReaderScreen() {
         style={styles.verseList}
         contentContainerStyle={styles.verseListContent}
         data={verses}
-        keyExtractor={(item) => String(item.verse)}
+        keyExtractor={verseKey}
         renderItem={renderVerse}
         onViewableItemsChanged={viewableItemsHandler}
         viewabilityConfig={CHAPTER_VIEWABILITY_CONFIG}
-        initialNumToRender={16}
-        maxToRenderPerBatch={12}
+        initialNumToRender={15}
+        maxToRenderPerBatch={15}
         windowSize={5}
-        removeClippedSubviews={false}
+        removeClippedSubviews={Platform.OS === 'android'}
         ListEmptyComponent={
-          loading ? (
-            <ActivityIndicator style={styles.spinner} size="large" color={theme.primary} />
+          isLoadingChapter ? (
+            <View style={styles.loadingCard}>
+              <ActivityIndicator size="large" color={theme.primary} />
+              <Text style={styles.loadingText}>Loading scripture...</Text>
+            </View>
           ) : error ? (
             <View style={styles.errorCard}>
               <Text style={styles.errorTitle}>Chapter unavailable</Text>
@@ -743,7 +996,7 @@ export default function BibleReaderScreen() {
           ) : undefined
         }
         ListFooterComponent={
-          !loading && totalVerses > 0 ? (
+          !isLoadingChapter && totalVerses > 0 ? (
             <Text style={styles.listEndNote}>
               {secondaryBookName || currentBook.englishName} {chapter} • {totalVerses} verses
             </Text>
@@ -751,73 +1004,59 @@ export default function BibleReaderScreen() {
         }
       />
 
-      {/* Floating minimal highlight palette + inline mark-read action */}
+      {/* FIX 4 — Floating highlight palette in a centered overlay: count ·
+          5 evenly-distributed color dots · clear, edge to edge. */}
       {selectedVerses.length > 0 ? (
-        <View style={[styles.highlightBar, { bottom: insets.bottom + 12 }]}>
-          <ScalePressable
-            style={[styles.barReadChip, markReadHandled ? styles.barReadChipDone : null]}
-            onPress={handleMarkReadPress}
-            accessibilityRole="button"
-            accessibilityLabel={markReadHandled ? 'Unmark selected verses read' : 'Mark selected verses read'}
-          >
-            <Text
-              style={[
-                styles.barReadChipText,
-                markReadHandled ? styles.barReadChipTextDone : null,
-              ]}
+        <View style={[styles.highlightBarOverlay, { bottom: Math.max(insets.bottom, 16) }]}>
+          <View style={styles.highlightBar}>
+            <View style={styles.barCountBadge}>
+              <Text numberOfLines={1} style={styles.barCountText}>
+                {selectedVerses.length}
+              </Text>
+            </View>
+            <View style={styles.highlightColors}>
+              {HIGHLIGHT_COLORS.map((color) => {
+                const active = selectedVerses.every(
+                  (verse) => findVerseHighlight(verse)?.color_hex === color.hex,
+                );
+                return (
+                  <ScalePressable
+                    key={color.key}
+                    style={[styles.colorDot, { backgroundColor: color.hex }, active ? styles.colorDotActive : null]}
+                    onPress={() => handleHighlightColor(color.hex)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${color.englishName} highlight`}
+                  >
+                    <Text style={styles.colorDotCheck}>{active ? '✓' : ''}</Text>
+                  </ScalePressable>
+                );
+              })}
+            </View>
+            <Pressable
+              style={styles.highlightBarCloseBtn}
+              onPress={() => setSelectedVerses([])}
+              accessibilityRole="button"
+              accessibilityLabel="Close highlight palette"
             >
-              {markReadLabel}
-            </Text>
-          </ScalePressable>
-          <Text numberOfLines={1} style={styles.highlightBarLabel}>
-            {primaryBookName} {chapter}:{selectedVerses.join(', ')}
-          </Text>
-          <View style={styles.highlightColors}>
-            {HIGHLIGHT_COLORS.map((color) => {
-              const active = selectedVerses.length > 0 && selectedVerses.every(
-                (verse) => findVerseHighlight(verse)?.color_hex === color.hex,
-              );
-              return (
-                <ScalePressable
-                  key={color.key}
-                  style={[styles.colorDot, { backgroundColor: color.hex }, active ? styles.colorDotActive : null]}
-                  onPress={() => handleHighlightColor(color.hex)}
-                  accessibilityRole="button"
-                  accessibilityLabel={`${color.englishName} highlight`}
-                >
-                  <Text style={styles.colorDotCheck}>{active ? '✓' : ''}</Text>
-                </ScalePressable>
-              );
-            })}
-            {selectedVerses.some((verse) => findVerseHighlight(verse)) ? (
-              <ScalePressable
-                style={styles.removeButton}
-                onPress={handleRemoveHighlight}
-                accessibilityRole="button"
-                accessibilityLabel="Remove highlights from selected verses"
-              >
-                <Text style={styles.removeButtonText}>Remove</Text>
-              </ScalePressable>
-            ) : null}
+              <Text style={styles.highlightBarClose}>{'✕'}</Text>
+            </Pressable>
           </View>
-          <Pressable
-            onPress={() => setSelectedVerses([])}
-            accessibilityRole="button"
-            accessibilityLabel="Close highlight palette"
-          >
-            <Text style={styles.highlightBarClose}>{'✕'}</Text>
-          </Pressable>
         </View>
       ) : null}
 
-      {/* Book & chapter selector */}
+      {/* Book & chapter selector — no dead black gap above the header */}
       <Modal
         visible={pickerOpen}
         animationType="slide"
         onRequestClose={() => setPickerOpen(false)}
       >
         <View style={[styles.pickerScreen, { backgroundColor: theme.background }]}>
-          <View style={styles.pickerHeader}>
+          <View
+            style={[
+              styles.pickerHeader,
+              { paddingTop: modalHeaderTop, paddingBottom: 10 },
+            ]}
+          >
             <ScalePressable
               onPress={() => setPickerOpen(false)}
               accessibilityRole="button"
@@ -849,25 +1088,42 @@ export default function BibleReaderScreen() {
           </View>
 
           {pickerStage === 'books' || pickerBook === null ? (
-            <ScrollView contentContainerStyle={styles.pickerBookList}>
-              {(['OT', 'NT'] as const).map((testament) => (
-                <View key={testament}>
-                  <Text style={styles.pickerSectionLabel}>
-                    {testament === 'OT' ? activeBookNames.otLabel : activeBookNames.ntLabel}
-                  </Text>
-                  {getBooksByTestament(testament).map((book) => {
+            <View style={{ flex: 1 }}>
+              <View style={styles.bookSearchRow}>
+                <TextInput
+                  style={styles.bookSearchInput}
+                  placeholder="Search books..."
+                  placeholderTextColor={theme.isDark ? '#8E8E93' : '#687076'}
+                  value={bookSearchQuery}
+                  onChangeText={setBookSearchQuery}
+                  autoCorrect={false}
+                />
+                {bookSearchQuery.length > 0 ? (
+                  <Pressable
+                    style={styles.searchClearBtn}
+                    onPress={() => setBookSearchQuery('')}
+                    accessibilityRole="button"
+                    accessibilityLabel="Clear book search"
+                  >
+                    <Text style={styles.searchClearText}>✕</Text>
+                  </Pressable>
+                ) : null}
+              </View>
+              <ScrollView contentContainerStyle={styles.pickerBookList}>
+                {filteredBooks ? (
+                  filteredBooks.map(({ book, manifest }) => {
                     const isCurrent = book.id === bookId;
-                    const names = localizedBook(book.id);
                     return (
                       <ScalePressable
                         key={book.id}
                         style={[styles.pickerBookRow, isCurrent ? styles.pickerBookRowActive : null]}
                         onPress={() => {
                           setPickerBook(book);
+                          setPickerChapterCount(manifest.chapters);
                           setPickerStage('chapters');
                         }}
                         accessibilityRole="button"
-                        accessibilityLabel={`${names.secondaryName || names.primaryName}, ${book.chaptersCount} chapters`}
+                        accessibilityLabel={`${manifest.englishName || manifest.nativeName}, ${manifest.chapters} chapters`}
                       >
                         <Text
                           numberOfLines={1}
@@ -876,8 +1132,10 @@ export default function BibleReaderScreen() {
                             isCurrent ? styles.pickerBookTextActive : null,
                           ]}
                         >
-                          {names.primaryName}
+                          {manifest.nativeName}
                         </Text>
+                        {/* FIX 4 — the version's own native name on the left,
+                            canonical English name on the right. */}
                         <Text
                           numberOfLines={1}
                           style={[
@@ -885,25 +1143,78 @@ export default function BibleReaderScreen() {
                             isCurrent ? styles.pickerBookTextActive : null,
                           ]}
                         >
-                          {names.secondaryName}
+                          {manifest.englishName}
                         </Text>
                       </ScalePressable>
                     );
-                  })}
-                </View>
-              ))}
-            </ScrollView>
+                  })
+                ) : (
+                  ([
+                    { key: 'ot', label: activeBookNames.otLabel, books: oldTestamentBooks },
+                    { key: 'nt', label: activeBookNames.ntLabel, books: newTestamentBooks },
+                  ] as const).map((section) => {
+                    // FIX 4 — render each testament section only when the
+                    // active version actually carries books in that range.
+                    if (section.books.length === 0) return null;
+                    return (
+                      <View key={section.key}>
+                        <Text style={styles.pickerSectionLabel}>{section.label}</Text>
+                        {section.books.map(({ book, manifest }) => {
+                          const isCurrent = book.id === bookId;
+                          return (
+                            <ScalePressable
+                              key={book.id}
+                              style={[styles.pickerBookRow, isCurrent ? styles.pickerBookRowActive : null]}
+                              onPress={() => {
+                                setPickerBook(book);
+                                setPickerChapterCount(manifest.chapters);
+                                setPickerStage('chapters');
+                              }}
+                              accessibilityRole="button"
+                              accessibilityLabel={`${manifest.englishName || manifest.nativeName}, ${manifest.chapters} chapters`}
+                            >
+                              <Text
+                                numberOfLines={1}
+                                style={[
+                                  styles.pickerBookPrimary,
+                                  isCurrent ? styles.pickerBookTextActive : null,
+                                ]}
+                              >
+                                {manifest.nativeName}
+                              </Text>
+                              <Text
+                                numberOfLines={1}
+                                style={[
+                                  styles.pickerBookSecondary,
+                                  isCurrent ? styles.pickerBookTextActive : null,
+                                ]}
+                              >
+                                {manifest.englishName}
+                              </Text>
+                            </ScalePressable>
+                          );
+                        })}
+                      </View>
+                    );
+                  })
+                )}
+              </ScrollView>
+            </View>
           ) : (
             <ScrollView contentContainerStyle={styles.pickerChapterWrap}>
               <View style={styles.chapterGrid}>
-                {Array.from({ length: pickerBook.chaptersCount }, (_, index) => index + 1).map(
+                {Array.from({ length: pickerChapterCount }, (_, index) => index + 1).map(
                   (chapterNumber) => {
                     const isCurrent = pickerBook.id === bookId && chapterNumber === chapter;
                     const names = localizedBook(pickerBook.id);
                     return (
                       <ScalePressable
                         key={chapterNumber}
-                        style={[styles.chapterCell, isCurrent ? styles.chapterCellActive : null]}
+                        style={[
+                          styles.chapterCell,
+                          { width: tileWidth, height: 50, borderRadius: 12 },
+                          isCurrent ? styles.chapterCellActive : null,
+                        ]}
                         onPress={() => selectChapter(pickerBook.id, chapterNumber)}
                         accessibilityRole="button"
                         accessibilityLabel={`${names.secondaryName || names.primaryName} chapter ${chapterNumber}`}
@@ -923,7 +1234,7 @@ export default function BibleReaderScreen() {
 
       {/* Quick version switcher (top-left pill): every version on this device */}
       <Modal visible={switcherOpen} transparent animationType="fade" onRequestClose={() => setSwitcherOpen(false)}>
-        <View style={styles.switcherOverlay}>
+        <View style={[styles.switcherOverlay, { paddingTop: insets.top + 6 }]}>
           <Pressable style={styles.switcherTouch} onPress={() => setSwitcherOpen(false)} />
           <View style={styles.switcherCard}>
             <View style={styles.switcherHeader}>
@@ -951,7 +1262,7 @@ export default function BibleReaderScreen() {
                     accessibilityLabel={active ? `Already reading ${meta.shortName}` : `Read with ${meta.shortName}`}
                   >
                     <View style={styles.switcherLanguageBadge}>
-                      <Text numberOfLines={1} style={styles.switcherLanguageText}>
+                      <Text style={styles.switcherLanguageText}>
                         {meta.language || '—'}
                       </Text>
                     </View>
@@ -987,7 +1298,7 @@ export default function BibleReaderScreen() {
 
       {/* First-launch setup overlay: materializes the 66-book Tamil BSI offline */}
       {setupState !== 'ready' ? (
-        <View style={[styles.setupOverlay, { backgroundColor: theme.background }]}>
+        <View style={[styles.setupOverlay, { backgroundColor: theme.background, paddingTop: Math.max(insets.top, 28) + 8, paddingBottom: Math.max(insets.bottom, 16) }]}>
           <SelahAppIconSvg size={84} color={theme.primary} />
           <Text style={[styles.setupTitle, { color: theme.text }]}>
             Setting up Tamil BSI Bible (66 Books) for Offline Reading...
@@ -1071,9 +1382,28 @@ const VerseRow = memo(function VerseRow({
       accessibilityState={{ selected: isSelected }}
     >
       <View style={styles.verseLine}>
-        <View style={styles.verseNumberBadge}>
-          <Text style={styles.verseNumber}>{verseNumber}</Text>
-          {isRead ? <Text style={styles.verseReadCheck}>✓</Text> : null}
+        {/* Symmetric 32x28 badge wrap: the 28x28 verse badge never resizes, and
+            the read check sits outside it so digits keep their position. */}
+        <View style={styles.verseBadgeWrap}>
+          <View style={[styles.verseBadge, isRead ? styles.verseBadgeRead : null]}>
+            <Text style={[styles.verseNumber, isRead ? styles.verseNumberRead : null]}>
+              {verseNumber}
+            </Text>
+          </View>
+          {isRead ? (
+            <View style={[styles.verseReadCheckBadge, isDark ? styles.verseReadCheckBadgeDark : null]}>
+              <Svg width={7} height={7} viewBox="0 0 12 12">
+                <Path
+                  d="M2.5 6L5 8.5L9.5 3.5"
+                  stroke="#FFFFFF"
+                  strokeWidth={1.8}
+                  fill="none"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </Svg>
+            </View>
+          ) : null}
         </View>
         <Text
           style={[styles.verseText, highlightStyle ? { color: highlightStyle.textColor } : null]}
@@ -1088,70 +1418,58 @@ const VerseRow = memo(function VerseRow({
 function makeStyles(theme: AppTheme) {
   return StyleSheet.create({
     screen: { flex: 1 },
-    // Row 1 — Top Header
+    // Row 1 — Top Header (status-bar inset is the inline paddingTop)
     headerRow: {
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'space-between',
-      gap: 8,
-      paddingHorizontal: 10,
-      paddingVertical: 6,
-      minHeight: 44,
+      width: '100%',
+      minHeight: 48,
+      paddingHorizontal: 14,
+      paddingBottom: 6,
       backgroundColor: theme.surface,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
     },
-    headerLeft: {
-      flex: 1,
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: 6,
-      minWidth: 0,
-    },
     headerRightControls: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 6,
+      gap: 8,
       flexShrink: 0,
     },
     versionBadge: {
-      minWidth: 115,
-      maxWidth: '48%',
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 6,
-      borderRadius: 999,
+      height: 40,
+      minWidth: 135,
+      paddingHorizontal: 12,
+      borderRadius: 20,
+      gap: 7,
+      backgroundColor: theme.surface,
       borderWidth: 1,
-      borderColor: theme.primary,
-      backgroundColor: theme.surfaceMuted,
-      paddingHorizontal: 10,
-      paddingVertical: 6,
-      minHeight: 38,
+      borderColor: theme.border,
     },
     versionBadgeText: {
-      color: theme.primary,
-      fontSize: 13,
-      lineHeight: 20,
-      fontWeight: '800',
+      fontSize: 13.5,
+      fontWeight: '700',
+      color: theme.text,
       flexShrink: 1,
     },
-    versionBadgeCaret: { color: theme.primary, fontSize: 11, fontWeight: '700' },
     readChip: {
-      minHeight: 34,
+      height: 36,
+      paddingHorizontal: 12,
+      borderRadius: 18,
       justifyContent: 'center',
-      borderRadius: 999,
       borderWidth: 1,
       borderColor: theme.primary,
       backgroundColor: theme.surfaceMuted,
-      paddingHorizontal: 12,
-      paddingVertical: 5,
     },
     readChipDone: { backgroundColor: theme.surfaceMuted, borderColor: theme.border },
     readChipText: { color: theme.primary, fontSize: 12, fontWeight: '700' },
     readChipTextDone: { color: '#16A34A' },
     themeToggle: {
-      width: 34,
-      height: 34,
+      width: 36,
+      height: 36,
       borderRadius: 999,
       borderWidth: 1,
       borderColor: theme.border,
@@ -1159,67 +1477,109 @@ function makeStyles(theme: AppTheme) {
       alignItems: 'center',
       justifyContent: 'center',
     },
-    // Row 2 — Chapter Navigation Bar
+    // Row 2 — Chapter Navigation Bar (FIX 2): the bar adds up to exactly
+    // `sideBtnWidth + gap + centerPillWidth + gap + sideBtnWidth + rowPadding`
+    // because every child is sized with explicit pixels, so `Next >` can never
+    // be pushed off-screen.
     chapterNavBar: {
       flexDirection: 'row',
       alignItems: 'center',
-      paddingHorizontal: 10,
+      justifyContent: 'center',
+      width: '100%',
+      paddingHorizontal: 12,
       paddingVertical: 6,
       gap: 8,
       backgroundColor: theme.surface,
     },
     navButton: {
-      width: 40,
-      height: 44,
+      width: 66,
+      height: 42,
       borderRadius: 12,
-      backgroundColor: theme.surfaceMuted,
       alignItems: 'center',
       justifyContent: 'center',
-      gap: 0,
+      flexShrink: 0,
+      backgroundColor: theme.surfaceMuted,
     },
     navButtonDisabled: { opacity: 0.35 },
-    navButtonGlyph: { color: theme.text, fontSize: 17, lineHeight: 20, fontWeight: '700' },
-    navButtonLabel: { color: theme.textMuted, fontSize: 10, lineHeight: 12, fontWeight: '700' },
+    navButtonLabel: {
+      color: theme.text,
+      fontSize: 13,
+      lineHeight: 16,
+      fontWeight: '700',
+      textAlign: 'center',
+    },
     selectorButton: {
-      flex: 1,
-      marginHorizontal: 8,
+      height: 44,
+      borderRadius: 14,
+      paddingHorizontal: 10,
       alignItems: 'center',
       justifyContent: 'center',
-      minWidth: 0,
-      minHeight: 40,
-      borderRadius: 10,
+      overflow: 'hidden',
       backgroundColor: theme.surfaceMuted,
-      paddingHorizontal: 12,
-      paddingVertical: 5,
     },
-    selectorText: { color: theme.text, fontSize: 16, lineHeight: 22, fontWeight: '700' },
+    selectorText: {
+      color: theme.text,
+      fontSize: 16,
+      lineHeight: 22,
+      fontWeight: '700',
+      textAlign: 'center',
+    },
     selectorSubText: {
       color: theme.textMuted,
       fontSize: 11,
       lineHeight: 15,
       fontWeight: '600',
+      textAlign: 'center',
     },
     selectorCaret: { color: theme.textMuted, fontSize: 12 },
-    // Thin always-visible progress bar under Row 2
+    // Thin static progress bar under Row 2
     chapterProgressTrack: {
       height: 3,
+      width: '100%',
       borderRadius: 99,
       overflow: 'hidden',
       backgroundColor: theme.surfaceMuted,
-      marginHorizontal: 10,
-      marginTop: 4,
+      marginTop: 6,
+      marginBottom: 6,
     },
     chapterProgressFill: {
       height: '100%',
       borderRadius: 99,
       backgroundColor: theme.primary,
     },
+    bookSearchRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginHorizontal: 16,
+      marginTop: 8,
+      marginBottom: 10,
+      backgroundColor: theme.surfaceMuted,
+      borderRadius: 12,
+      borderWidth: 1,
+      borderColor: theme.border,
+      paddingHorizontal: 12,
+    },
+    bookSearchInput: {
+      flex: 1,
+      height: 40,
+      fontSize: 14,
+      color: theme.text,
+    },
+    searchClearBtn: {
+      padding: 6,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    searchClearText: {
+      fontSize: 14,
+      color: theme.textMuted,
+      fontWeight: '600',
+    },
     switcherOverlay: {
       flex: 1,
       backgroundColor: 'rgba(0,0,0,0.55)',
       alignItems: 'center',
       justifyContent: 'flex-start',
-      paddingTop: 60,
       padding: 16,
     },
     switcherTouch: { position: 'absolute', top: 0, right: 0, bottom: 0, left: 0 },
@@ -1258,7 +1618,7 @@ function makeStyles(theme: AppTheme) {
     versionRowActive: { borderColor: theme.primary },
     switcherLanguageBadge: {
       alignSelf: 'flex-start',
-      maxWidth: 96,
+      flexShrink: 1,
       borderRadius: 6,
       backgroundColor: theme.surface,
       borderWidth: StyleSheet.hairlineWidth,
@@ -1284,7 +1644,16 @@ function makeStyles(theme: AppTheme) {
     switcherDownloadText: { color: theme.primary, fontSize: 14, fontWeight: '700' },
     verseList: { flex: 1 },
     verseListContent: { paddingHorizontal: 14, paddingTop: 8, paddingBottom: 96 },
-    spinner: { marginTop: 32 },
+    loadingCard: {
+      marginTop: 32,
+      alignItems: 'center',
+      gap: 12,
+    },
+    loadingText: {
+      color: theme.textMuted,
+      fontSize: 13,
+      fontWeight: '600',
+    },
     listEndNote: {
       color: theme.textMuted,
       fontSize: 12,
@@ -1299,27 +1668,47 @@ function makeStyles(theme: AppTheme) {
     },
     verseRowSelected: { backgroundColor: theme.surfaceMuted },
     verseLine: { flexDirection: 'row', alignItems: 'flex-start', gap: 9 },
-    verseNumberBadge: {
-      minWidth: 24,
-      height: 24,
-      borderRadius: 8,
-      backgroundColor: theme.surfaceMuted,
+    // Fixed 32x28 wrap so the digit badge never resizes; check floats outside.
+    verseBadgeWrap: {
+      width: 32,
+      height: 28,
+      alignItems: 'flex-start',
+      justifyContent: 'flex-start',
+      marginRight: 12,
+      marginTop: 2,
+    },
+    verseBadge: {
+      width: 28,
+      height: 28,
+      borderRadius: 9,
+      backgroundColor: theme.surface,
       borderWidth: StyleSheet.hairlineWidth,
       borderColor: theme.border,
       alignItems: 'center',
       justifyContent: 'center',
-      marginTop: 2,
-      paddingHorizontal: 4,
-      gap: 1,
     },
-    verseText: { flex: 1, fontSize: 17, lineHeight: 28, color: theme.text },
+    verseBadgeRead: {
+      backgroundColor: theme.isDark ? 'rgba(16,185,129,0.18)' : '#D1FAE5',
+      borderWidth: 1.5,
+      borderColor: '#10B981',
+    },
     verseNumber: { color: theme.primary, fontSize: 12, fontWeight: '800', fontVariant: ['tabular-nums'] },
-    verseReadCheck: {
-      color: '#16A34A',
-      fontSize: 9,
-      lineHeight: 10,
-      fontWeight: '800',
+    verseNumberRead: { color: '#059669' },
+    verseReadCheckBadge: {
+      position: 'absolute',
+      top: -4,
+      right: -4,
+      width: 12,
+      height: 12,
+      borderRadius: 6,
+      backgroundColor: '#10B981',
+      borderWidth: 1,
+      borderColor: theme.surface,
+      alignItems: 'center',
+      justifyContent: 'center',
     },
+    verseReadCheckBadgeDark: { borderColor: theme.background },
+    verseText: { flex: 1, fontSize: 17, lineHeight: 28, color: theme.text },
     errorCard: {
       marginTop: 24,
       borderRadius: 12,
@@ -1340,37 +1729,58 @@ function makeStyles(theme: AppTheme) {
       paddingVertical: 8,
     },
     errorButtonText: { color: theme.primaryForeground, fontWeight: '600', fontSize: 14 },
-    highlightBar: {
+    // FIX 4 — full-width overlay wrapper; the pill inside is centered and
+    // distributes count · dots · clear evenly from edge to edge.
+    highlightBarOverlay: {
       position: 'absolute',
-      left: 12,
-      right: 12,
-      borderRadius: 14,
+      left: 16,
+      right: 16,
+      alignItems: 'center',
+    },
+    highlightBar: {
+      width: '100%',
+      maxWidth: 420,
+      height: 56,
+      paddingHorizontal: 18,
+      borderRadius: 28,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
       backgroundColor: theme.surface,
       borderWidth: 1,
       borderColor: theme.border,
-      paddingVertical: 10,
-      paddingHorizontal: 12,
+      elevation: 6,
+      shadowColor: '#000',
+      shadowOpacity: 0.14,
+      shadowRadius: 10,
+      shadowOffset: { width: 0, height: 4 },
+    },
+    barCountBadge: {
+      minWidth: 28,
+      height: 28,
+      borderRadius: 14,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: theme.primary,
+      paddingHorizontal: 6,
+    },
+    barCountText: {
+      color: theme.primaryForeground,
+      fontSize: 13,
+      fontWeight: '700',
+      fontVariant: ['tabular-nums'],
+    },
+    highlightColors: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 10,
+      justifyContent: 'space-evenly',
+      flex: 1,
+      marginHorizontal: 12,
     },
-    barReadChip: {
-      borderRadius: 999,
-      borderWidth: 1,
-      borderColor: theme.primary,
-      backgroundColor: theme.surfaceMuted,
-      paddingHorizontal: 10,
-      paddingVertical: 6,
-    },
-    barReadChipDone: { borderColor: theme.border },
-    barReadChipText: { color: theme.primary, fontSize: 12, fontWeight: '800' },
-    barReadChipTextDone: { color: '#16A34A' },
-    highlightBarLabel: { flex: 1, color: theme.text, fontSize: 13, fontWeight: '600' },
-    highlightColors: { flexDirection: 'row', alignItems: 'center', gap: 8 },
     colorDot: {
-      width: 30,
-      height: 30,
-      borderRadius: 999,
+      width: 32,
+      height: 32,
+      borderRadius: 16,
       alignItems: 'center',
       justifyContent: 'center',
       borderWidth: 1,
@@ -1381,22 +1791,20 @@ function makeStyles(theme: AppTheme) {
       borderWidth: 2,
     },
     colorDotCheck: { fontSize: 14, fontWeight: '800', color: '#1B1F27' },
-    removeButton: {
-      borderRadius: 999,
-      borderWidth: 1,
-      borderColor: theme.border,
-      paddingHorizontal: 10,
-      paddingVertical: 7,
+    highlightBarCloseBtn: {
+      width: 32,
+      height: 32,
+      borderRadius: 16,
+      alignItems: 'center',
+      justifyContent: 'center',
     },
-    removeButtonText: { color: '#DC2626', fontWeight: '700', fontSize: 12 },
-    highlightBarClose: { color: theme.textMuted, fontSize: 16, fontWeight: '600' },
-    pickerScreen: { flex: 1, paddingTop: 12 },
+    highlightBarClose: { color: theme.textMuted, fontSize: 15, fontWeight: '700' },
+    pickerScreen: { flex: 1 },
     pickerHeader: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: 12,
       paddingHorizontal: 16,
-      paddingBottom: 10,
     },
     pickerClose: { color: theme.text, fontSize: 18, fontWeight: '600' },
     pickerTitle: { flex: 1, color: theme.text, fontSize: 17, fontWeight: '700', textAlign: 'center' },
@@ -1427,16 +1835,13 @@ function makeStyles(theme: AppTheme) {
       textAlign: 'right',
     },
     pickerBookTextActive: { color: theme.primary, fontWeight: '700' },
-    pickerChapterWrap: { padding: 16 },
+    pickerChapterWrap: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 40 },
     chapterGrid: {
       flexDirection: 'row',
       flexWrap: 'wrap',
-      gap: 8,
+      gap: 10,
     },
     chapterCell: {
-      width: 56,
-      height: 44,
-      borderRadius: 10,
       borderWidth: 1,
       borderColor: theme.border,
       backgroundColor: theme.surface,

@@ -137,6 +137,72 @@ for (const book of BIBLE_BOOKS) {
 }
 
 // ---------------------------------------------------------------------------
+// Standard 3-letter USFM canonical book codes (GEN..REV, 1-66)
+// ---------------------------------------------------------------------------
+export const USFM_BOOK_CODES: readonly string[] = [
+  'GEN', 'EXO', 'LEV', 'NUM', 'DEU', 'JOS', 'JDG', 'RUT', '1SA', '2SA',
+  '1KI', '2KI', '1CH', '2CH', 'EZR', 'NEH', 'EST', 'JOB', 'PSA', 'PRO',
+  'ECC', 'SNG', 'ISA', 'JER', 'LAM', 'EZK', 'DAN', 'HOS', 'JOL', 'AMO',
+  'OBA', 'JON', 'MIC', 'NAM', 'HAB', 'ZEP', 'HAG', 'ZEC', 'MAL', 'MAT',
+  'MRK', 'LUK', 'JHN', 'ACT', 'ROM', '1CO', '2CO', 'GAL', 'EPH', 'PHP',
+  'COL', '1TH', '2TH', '1TI', '2TI', 'TIT', 'PHM', 'HEB', 'JAS', '1PE',
+  '2PE', '1JN', '2JN', '3JN', 'JUD', 'REV',
+];
+
+const USFM_TO_BOOK_ID: Readonly<Record<string, number>> = Object.fromEntries(
+  USFM_BOOK_CODES.map((code, index) => [code, index + 1])
+);
+
+/** Get 3-letter USFM code for canonical book ID (1-66). Falls back to GEN. */
+export function getUsfmBookCode(bookId: number): string {
+  return USFM_BOOK_CODES[bookId - 1] ?? 'GEN';
+}
+
+/** Get canonical book ID (1-66) from 3-letter USFM code. */
+export function getBookIdFromUsfm(usfm: string): number | null {
+  const normalized = (usfm ?? '').trim().toUpperCase();
+  return USFM_TO_BOOK_ID[normalized] ?? null;
+}
+
+/**
+ * Infer the canonical book id (1-66) from a display name ("Mark", "மத்தேயு",
+ * "Matt"...). Used only as a safety net for PARTIAL payloads that carry books
+ * without USFM codes — e.g. a translation that ships only Mark and where
+ * positional (array-index) mapping would wrongly return Genesis (id 1).
+ */
+export function getBookIdFromBookName(name: string): number | null {
+  const cleaned = (name ?? '').trim().toLowerCase();
+  if (!cleaned) return null;
+  const match = BIBLE_BOOKS.find((book) => {
+    const candidates = [
+      book.englishName,
+      book.shortEnglishName ?? '',
+      book.tamilName,
+    ].map((candidate) => candidate.trim().toLowerCase());
+    return candidates.some((candidate) => candidate && candidate === cleaned);
+  });
+  return match?.id ?? null;
+}
+
+/**
+ * Metadata of one book inside an installed version, keyed by its TRUE
+ * canonical id (1..66). Populated by the loader from the version's USFM codes
+ * so partial Bibles (NT-only, OT-only, single-book...) never shift ids.
+ */
+export interface VersionBookMeta {
+  /** helloao USFM 3-letter code (GEN, MAT, MRK, REV...) or the best guess. */
+  usfm: string;
+  /** Name in the version's own language/dialect. */
+  name: string;
+  /** helloao `commonName` (English-ish), falling back to `name`. */
+  commonName: string;
+  /** Number of chapters the version records for this book (0 = unknown). */
+  numberOfChapters: number;
+  /** First chapter number present in the version (1 for prose Bibles). */
+  firstChapterNumber: number;
+}
+
+// ---------------------------------------------------------------------------
 // Native book names for the offline IRV languages
 //
 // Verified 2026-11-03 against the bible.helloao.org `books.json` payloads of
@@ -217,12 +283,44 @@ const KANNADA_BOOK_NAMES: string[] = [
   '1 ಯೋಹಾನನು', '2 ಯೋಹಾನನು', '3 ಯೋಹಾನನು', 'ಯೂದನು', 'ಪ್ರಕಟಣೆ',
 ];
 
+/** Español (Spanish PDT / RVR). */
+const SPANISH_BOOK_NAMES: string[] = [
+  'Génesis', 'Éxodo', 'Levítico', 'Números', 'Deuteronomio', 'Josué', 'Jueces',
+  'Rut', '1 Samuel', '2 Samuel', '1 Reyes', '2 Reyes', '1 Crónicas', '2 Crónicas',
+  'Esdras', 'Nehemías', 'Ester', 'Job', 'Salmos', 'Proverbios', 'Eclesiastés',
+  'Cantares', 'Isaías', 'Jeremías', 'Lamentaciones', 'Ezequiel', 'Daniel',
+  'Oseas', 'Joel', 'Amós', 'Abdías', 'Jonás', 'Miqueas', 'Nahúm', 'Habacuc',
+  'Sofonías', 'Hageo', 'Zacarías', 'Malaquías', 'Mateo', 'Marcos', 'Lucas',
+  'Juan', 'Hechos', 'Romanos', '1 Corintios', '2 Corintios', 'Gálatas',
+  'Efesios', 'Filipenses', 'Colosenses', '1 Tesalonicenses', '2 Tesalonicenses',
+  '1 Timoteo', '2 Timoteo', 'Tito', 'Filemón', 'Hebreos', 'Santiago',
+  '1 Pedro', '2 Pedro', '1 Juan', '2 Juan', '3 Juan', 'Judas', 'Apocalipsis',
+];
+
+/** עברית (Hebrew Masoretic / Delitzsch). */
+const HEBREW_BOOK_NAMES: string[] = [
+  'בראשית', 'שמות', 'ויקרא', 'במדבר', 'דברים', 'יהושע', 'שופטים', 'רות',
+  'שמואל א׳', 'שמואל ב׳', 'מלכים א׳', 'מלכים ב׳', 'דברי הימים א׳', 'דברי הימים ב׳',
+  'עזרא', 'נחמיה', 'אסתר', 'איוב', 'תהלים', 'משಲಿ', 'קהלת', 'שיר השירים',
+  'ישעיהו', 'ירמיהו', 'איכה', 'יחזקאל', 'דניאל', 'הושע', 'יואל', 'עמוס',
+  'עובדיה', 'יונה', 'מיכה', 'נחום', 'חבקוק', 'צפניה', 'חגי', 'זכריה',
+  'מלאכי', 'מתי', 'מרקוס', 'לוקס', 'יוחנן', 'מעשי השליחים', 'רומים',
+  '1 קורינתים', '2 קורינתים', 'גלטים', 'אפסים', 'פיליפים', 'קולוסים',
+  '1 תסלוניקים', '2 תסלוניקים', '1 טימותיוס', '2 טימותיוס', 'טיטוס',
+  'פילימון', 'עברים', 'יעקב', '1 פטרוס', '2 פטרוס', '1 יוחנן', '2 יוחנן',
+  '3 יוחנן', 'יהודה', 'התגלות',
+];
+
 /** Language code -> canonical-id-indexed native book-name list. */
 export const NATIVE_BOOK_NAMES: Readonly<Record<string, readonly string[]>> = {
   mal: MALAYALAM_BOOK_NAMES,
   hin: HINDI_BOOK_NAMES,
   tel: TELUGU_BOOK_NAMES,
   kan: KANNADA_BOOK_NAMES,
+  spa: SPANISH_BOOK_NAMES,
+  es: SPANISH_BOOK_NAMES,
+  heb: HEBREW_BOOK_NAMES,
+  hbo: HEBREW_BOOK_NAMES,
 };
 
 // ---------------------------------------------------------------------------
@@ -255,6 +353,8 @@ export interface LocalizedBookName {
  * - Tamil versions → BSI Tamil primary / English secondary, bilingual OT/NT
  *   labels.
  * - English versions → full English primary / compact abbreviation secondary.
+ * - Spanish versions → full Spanish primary / English secondary, Spanish OT/NT labels.
+ * - Hebrew versions → Hebrew primary / English secondary, Hebrew OT/NT labels.
  * - Every other language (Malayalam, Hindi, Telugu, Kannada, ...) → the
  *   version's own native book name when the parsed JSON carries one
  *   (`customBookNames`), otherwise the built-in IRV dictionary above, with
@@ -264,11 +364,22 @@ export function getLocalizedBookName(
   bookId: number,
   versionMeta?: BookLanguageVersionMeta | null,
   customBookNames?: Record<number, string> | null,
+  versionBooksById?: Record<number, VersionBookMeta | null> | null,
 ): LocalizedBookName {
   const book = getBookById(bookId) ?? BIBLE_BOOKS[0];
   const id = (versionMeta?.id ?? '').trim();
   const language = (versionMeta?.language ?? '').trim();
   const code = (versionMeta?.languageCode ?? '').trim().toLowerCase();
+
+  /**
+   * The version's own metadata for this canonical book id (USFM-derived, so a
+   * book that sits at array position 0 in a NT-only file is still book 41).
+   * The version's native/common name always beats the generic dictionaries.
+   */
+  const versionBook = versionBooksById?.[book.id] ?? null;
+  const versionNative = versionBook
+    ? versionBook.commonName || versionBook.name
+    : undefined;
 
   const isTamil =
     id === 'TAMIL_BSI' ||
@@ -297,8 +408,47 @@ export function getLocalizedBookName(
     };
   }
 
+  const isSpanish =
+    /spanish|español/i.test(language) ||
+    code === 'spa' ||
+    code === 'es' ||
+    id.toLowerCase().startsWith('spa_');
+  if (isSpanish) {
+    const native =
+      versionNative ??
+      customBookNames?.[book.id] ??
+      SPANISH_BOOK_NAMES[book.id - 1] ??
+      book.englishName;
+    return {
+      primaryName: native,
+      secondaryName: book.englishName,
+      otLabel: 'Antiguo Testamento',
+      ntLabel: 'Nuevo Testamento',
+    };
+  }
+
+  const isHebrew =
+    /hebrew|עברית/i.test(language) ||
+    code === 'heb' ||
+    code === 'hbo' ||
+    id.toLowerCase().startsWith('heb_');
+  if (isHebrew) {
+    const native =
+      versionNative ??
+      customBookNames?.[book.id] ??
+      HEBREW_BOOK_NAMES[book.id - 1] ??
+      book.englishName;
+    return {
+      primaryName: native,
+      secondaryName: book.englishName,
+      otLabel: 'תנ״ך (Old Testament)',
+      ntLabel: 'הברית החדשה (New Testament)',
+    };
+  }
+
   const nativeList = NATIVE_BOOK_NAMES[code];
   const native =
+    versionNative ??
     customBookNames?.[book.id] ??
     (nativeList ? nativeList[book.id - 1] : undefined) ??
     book.englishName;

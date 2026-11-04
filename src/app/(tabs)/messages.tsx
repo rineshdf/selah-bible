@@ -33,7 +33,6 @@ import {
   View,
 } from 'react-native';
 import { useFocusEffect } from 'expo-router';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '@/constants/ThemeContext';
 import { HIGHLIGHT_COLORS, getHighlightStyle, type AppTheme } from '@/constants/colors';
 import {
@@ -68,10 +67,38 @@ function pointNumberOf(blocks: MessageBlockRow[], block: MessageBlockRow): numbe
   return number;
 }
 
+/** Format a saved message date ('YYYY-MM-DD' or ISO timestamp) into a clean localized date. */
+function formatMessageDate(rawDate?: string | null): string {
+  if (!rawDate) return '—';
+  const clean = rawDate.split('T')[0];
+  const parts = clean.split('-');
+  if (parts.length === 3) {
+    const year = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1;
+    const day = parseInt(parts[2], 10);
+    const dateObj = new Date(year, month, day);
+    if (!isNaN(dateObj.getTime())) {
+      return dateObj.toLocaleDateString('en-US', {
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      });
+    }
+  }
+  const dateObj = new Date(rawDate);
+  if (!isNaN(dateObj.getTime())) {
+    return dateObj.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+  }
+  return rawDate;
+}
+
 export default function MessagesScreen() {
   const { theme } = useAppTheme();
   const styles = makeStyles(theme);
-  const insets = useSafeAreaInsets();
 
   const [editingId, setEditingId] = useState<number | null>(null);
   /** Bumped on every tab focus so the list reloads after edits elsewhere. */
@@ -94,7 +121,6 @@ export default function MessagesScreen() {
         messageId={editingId}
         theme={theme}
         styles={styles}
-        topInset={insets.top}
         onClose={() => setEditingId(null)}
       />
     );
@@ -104,7 +130,6 @@ export default function MessagesScreen() {
     <MessagesListScreen
       theme={theme}
       styles={styles}
-      topInset={insets.top}
       onOpenMessage={setEditingId}
     />
   );
@@ -117,12 +142,10 @@ export default function MessagesScreen() {
 function MessagesListScreen({
   theme,
   styles,
-  topInset,
   onOpenMessage,
 }: {
   theme: AppTheme;
   styles: ReturnType<typeof makeStyles>;
-  topInset: number;
   onOpenMessage: (id: number) => void;
 }) {
   const [messages, setMessages] = useState<MessageRow[]>([]);
@@ -180,7 +203,7 @@ function MessagesListScreen({
     <View
       style={[
         styles.screen,
-        { backgroundColor: theme.background, paddingTop: topInset },
+        { backgroundColor: theme.background },
       ]}
     >
       <AppHeader
@@ -202,7 +225,7 @@ function MessagesListScreen({
 
       {filterDate ? (
         <View style={styles.datedFilterBar}>
-          <Text style={styles.datedFilterLabel}>Showing: {filterDate}</Text>
+          <Text numberOfLines={1} style={styles.datedFilterLabel}>Showing: {filterDate}</Text>
           <ScalePressable
             onPress={() => setFilterDate(null)}
             accessibilityRole="button"
@@ -250,9 +273,12 @@ function MessagesListScreen({
                   <Text numberOfLines={1} style={styles.messageMeta}>
                     {message.preacher ? `👤 ${message.preacher}` : '👤 —'}
                   </Text>
-                  <Text numberOfLines={1} style={styles.messageMeta}>
-                    {message.message_date ? `📅 ${message.message_date}` : '📅 —'}
-                  </Text>
+                  <View style={styles.messageDateMeta}>
+                    <CalendarSvg size={14} color={theme.textMuted} />
+                    <Text numberOfLines={1} style={styles.messageDateText}>
+                      {formatMessageDate((message as any).date || message.message_date || message.created_at)}
+                    </Text>
+                  </View>
                 </View>
               </ScalePressable>
               <Pressable
@@ -291,13 +317,11 @@ function MessageEditorScreen({
   messageId,
   theme,
   styles,
-  topInset,
   onClose,
 }: {
   messageId: number;
   theme: AppTheme;
   styles: ReturnType<typeof makeStyles>;
-  topInset: number;
   onClose: () => void;
 }) {
   const initial = getMessage(messageId);
@@ -419,7 +443,7 @@ function MessageEditorScreen({
     <View
       style={[
         styles.screen,
-        { backgroundColor: theme.background, paddingTop: topInset },
+        { backgroundColor: theme.background },
       ]}
     >
       {/* Editor top bar with the global theme toggle on the right */}
@@ -707,14 +731,15 @@ function makeStyles(theme: AppTheme) {
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'space-between',
+      gap: 8,
       paddingHorizontal: 16,
       paddingVertical: 8,
       backgroundColor: theme.surfaceMuted,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
     },
-    datedFilterLabel: { color: theme.text, fontSize: 13, fontWeight: '600' },
-    datedFilterClear: { color: theme.primary, fontSize: 13, fontWeight: '700' },
+    datedFilterLabel: { color: theme.text, fontSize: 13, fontWeight: '600', flexShrink: 1 },
+    datedFilterClear: { color: theme.primary, fontSize: 13, fontWeight: '700', flexShrink: 0 },
     listContent: {
       paddingHorizontal: 16,
       paddingTop: 12,
@@ -776,12 +801,26 @@ function makeStyles(theme: AppTheme) {
     },
     messageMetaRow: {
       flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
       gap: 12,
     },
     messageMeta: {
       flex: 1,
       color: theme.textMuted,
       fontSize: 13,
+      fontWeight: '500',
+    },
+    messageDateMeta: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
+      flexShrink: 0,
+    },
+    messageDateText: {
+      fontSize: 13,
+      fontWeight: '600',
+      color: theme.textMuted,
     },
     messageDelete: {
       width: 30,

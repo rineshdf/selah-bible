@@ -1,18 +1,20 @@
 /**
- * Backup & restore for all six SQLite tables in one JSON file.
+ * Backup & restore for all SQLite tables in one JSON file.
  *
- * Export walks the tables through `@/db/database`, writes a single JSON
- * document into the app cache directory and hands it over to `expo-sharing`
- * (Save to Files / AirDrop / WhatsApp...). Restore picks a file with
- * `expo-document-picker`, validates it and replaces the six tables inside one
- * transaction, keeping every restored id.
+ * Saves backups into DCIM/SelahBible/<YYYY-MM-DD>/SelahBible_Backup_<YYYY-MM-DD>_<HH-mm-ss>.json
+ * with both a local document copy and Android public DCIM copy (direct or SAF).
+ *
+ * Provides a 4-stage sandbox-safe URI reader (fetch -> XHR -> SAF -> FileSystem)
+ * that permanently fixes the Expo Go DocumentPicker cache access error.
  */
 
+import { Platform } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import * as DocumentPicker from 'expo-document-picker';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { SQLiteBindParams } from 'expo-sqlite';
-import { db } from '@/db/database';
+import { db, notifyProgressUpdated } from '@/db/database';
 
 // ---------------------------------------------------------------------------
 // Backup shape
@@ -25,6 +27,8 @@ export interface BackupTables {
   daily_devotions: Record<string, unknown>[];
   prayer_points: Record<string, unknown>[];
   reading_progress: Record<string, unknown>[];
+  /** Verse-level read progress (schema v5). */
+  verse_read_progress?: Record<string, unknown>[];
   /** Serial-numbered Rhema/Devotion/Worship entries (v2). */
   daily_entries: Record<string, unknown>[];
   /** Embedded Daily Walk scripture cards (v2). */
@@ -34,7 +38,7 @@ export interface BackupTables {
 }
 
 export interface BackupFile {
-  app: 'TamilBibleApp';
+  app: 'TamilBibleApp' | 'SelahBible' | 'SelahBibleApp';
   schemaVersion: number;
   exportedAt: string;
   tables: BackupTables;
@@ -54,12 +58,31 @@ export interface RestoreCounts {
   daily_devotions: number;
   prayer_points: number;
   reading_progress: number;
+  verse_read_progress?: number;
   daily_entries: number;
   daily_verses: number;
   reading_progress_v2: number;
 }
 
-export const BACKUP_SCHEMA_VERSION = 3;
+export interface ExportBackupResult {
+  success: boolean;
+  fileName: string;
+  displayPath: string;
+  dateFolder: string;
+  humanReadablePath: string;
+  localPath: string;
+}
+
+export interface SavedBackupItem {
+  uri: string;
+  fileName: string;
+  dateFolder: string;
+  displayPath: string;
+  size?: number;
+  modificationTime?: number;
+}
+
+export const BACKUP_SCHEMA_VERSION = 4;
 
 const TABLE_NAMES = [
   'highlights',
@@ -68,6 +91,7 @@ const TABLE_NAMES = [
   'daily_devotions',
   'prayer_points',
   'reading_progress',
+  'verse_read_progress',
   'daily_entries',
   'daily_verses',
   'reading_progress_v2',
@@ -75,6 +99,7 @@ const TABLE_NAMES = [
 
 /** Tables added after v1 — older backups may not carry them. */
 const OPTIONAL_TABLES: readonly TableName[] = [
+  'verse_read_progress',
   'daily_entries',
   'daily_verses',
   'reading_progress_v2',
@@ -102,6 +127,7 @@ const TABLE_COLUMNS: Record<TableName, readonly string[]> = {
     'verse_ref', 'verse_text', 'verse_note', 'verse_version_id',
   ],
   reading_progress: ['book_id', 'chapter', 'read_date'],
+  verse_read_progress: ['book_id', 'chapter', 'verse', 'read_at'],
   daily_entries: ['id', 'entry_date', 'section', 'serial_no', 'content', 'highlight_color', 'created_at'],
   daily_verses: [
     'id', 'entry_date', 'section', 'verse_ref', 'verse_text', 'note',
@@ -118,33 +144,51 @@ const AUTOINCREMENT_TABLES: readonly TableName[] = [
   'prayer_points',
 ];
 
+function pad2(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+/** Generate local date/time strings for the proper folder and file naming. */
+export function getBackupTimestampParts(date = new Date()): {
+  dateFolder: string;
+  timePart: string;
+  fileName: string;
+  displayPath: string;
+  humanReadablePath: string;
+} {
+  const yyyy = date.getFullYear();
+  const mm = pad2(date.getMonth() + 1);
+  const dd = pad2(date.getDate());
+  const hh = pad2(date.getHours());
+  const min = pad2(date.getMinutes());
+  const sec = pad2(date.getSeconds());
+
+  const dateFolder = `${yyyy}-${mm}-${dd}`;
+  const timePart = `${hh}-${min}-${sec}`;
+  const fileName = `SelahBible_Backup_${dateFolder}_${timePart}.json`;
+  const displayPath = `DCIM/SelahBible/${dateFolder}/${fileName}`;
+  const humanReadablePath = `Internal Storage/DCIM/SelahBible/${dateFolder}/${fileName}`;
+
+  return { dateFolder, timePart, fileName, displayPath, humanReadablePath };
+}
+
 // ---------------------------------------------------------------------------
 // Export
 // ---------------------------------------------------------------------------
-
-function timestampSlug(date = new Date()): string {
-  const pad = (value: number) => String(value).padStart(2, '0');
-  return [
-    date.getFullYear(), '-',
-    pad(date.getMonth() + 1), '-',
-    pad(date.getDate()), '-',
-    pad(date.getHours()),
-    pad(date.getMinutes()),
-  ].join('');
-}
 
 /**
  * Build the full backup document from the live database.
  * Exported separately so callers can preview counts before sharing.
  */
 export function buildBackupFile(): BackupFile {
-  const tables = {
+  const tables: BackupTables = {
     highlights: db.getAllSync<Record<string, unknown>>('SELECT * FROM highlights;'),
     messages: db.getAllSync<Record<string, unknown>>('SELECT * FROM messages;'),
     message_blocks: db.getAllSync<Record<string, unknown>>('SELECT * FROM message_blocks;'),
     daily_devotions: db.getAllSync<Record<string, unknown>>('SELECT * FROM daily_devotions;'),
     prayer_points: db.getAllSync<Record<string, unknown>>('SELECT * FROM prayer_points;'),
     reading_progress: db.getAllSync<Record<string, unknown>>('SELECT * FROM reading_progress;'),
+    verse_read_progress: db.getAllSync<Record<string, unknown>>('SELECT * FROM verse_read_progress;'),
     daily_entries: db.getAllSync<Record<string, unknown>>('SELECT * FROM daily_entries;'),
     daily_verses: db.getAllSync<Record<string, unknown>>('SELECT * FROM daily_verses;'),
     reading_progress_v2: db.getAllSync<Record<string, unknown>>('SELECT * FROM reading_progress_v2;'),
@@ -158,30 +202,186 @@ export function buildBackupFile(): BackupFile {
 }
 
 /**
- * Write every table into one JSON backup and open the system share sheet.
- * Returns the cache file URI that was shared.
+ * Helper to find or create a directory in Android Scoped Storage SAF.
  */
-export async function exportBackup(): Promise<string> {
+async function findOrCreateSafDirectory(parentUri: string, dirName: string): Promise<string> {
+  try {
+    const entries = await FileSystem.StorageAccessFramework.readDirectoryAsync(parentUri);
+    const existing = entries.find((u) => {
+      const decoded = decodeURIComponent(u);
+      return decoded.endsWith(`/${dirName}`) || decoded.endsWith(`:${dirName}`);
+    });
+    if (existing) return existing;
+  } catch {}
+  // 'vnd.android.document/directory' tells Android DocumentsContract to create a real folder
+  try {
+    if (typeof FileSystem.StorageAccessFramework.makeDirectoryAsync === 'function') {
+      return await FileSystem.StorageAccessFramework.makeDirectoryAsync(parentUri, dirName);
+    }
+  } catch {}
+  return await FileSystem.StorageAccessFramework.createFileAsync(
+    parentUri,
+    dirName,
+    'vnd.android.document/directory',
+  );
+}
+
+/**
+ * Save backup into DCIM/SelahBible/<YYYY-MM-DD>/SelahBible_Backup_<YYYY-MM-DD>_<HH-mm-ss>.json
+ *
+ * 1. Always saves local copy at `${FileSystem.documentDirectory}DCIM/SelahBible/${dateFolder}/${fileName}`.
+ * 2. On Android, also saves to device's public DCIM/SelahBible/${dateFolder}/ via direct path or SAF.
+ *
+ * Returns `{ success: true, fileName, displayPath: "DCIM/SelahBible/" + dateFolder + "/" + fileName, ... }`.
+ */
+export async function exportBackup(): Promise<ExportBackupResult> {
   const backup = buildBackupFile();
-  const path = `${FileSystem.cacheDirectory ?? ''}TamilBibleApp-backup-${timestampSlug()}.json`;
-  await FileSystem.writeAsStringAsync(path, JSON.stringify(backup, null, 2), {
+  const backupJsonString = JSON.stringify(backup, null, 2);
+  const { dateFolder, fileName, displayPath, humanReadablePath } = getBackupTimestampParts();
+
+  // 1. Always save a local copy first at ${FileSystem.documentDirectory}DCIM/SelahBible/${dateFolder}/${fileName}
+  const docDir = FileSystem.documentDirectory?.endsWith('/')
+    ? FileSystem.documentDirectory
+    : `${FileSystem.documentDirectory ?? ''}/`;
+  const localDir = `${docDir}DCIM/SelahBible/${dateFolder}`;
+  await FileSystem.makeDirectoryAsync(localDir, { intermediates: true });
+  const localPath = `${localDir}/${fileName}`;
+  await FileSystem.writeAsStringAsync(localPath, backupJsonString, {
     encoding: FileSystem.EncodingType.UTF8,
   });
-  if (Sharing.isAvailableAsync) {
-    const available = await Sharing.isAvailableAsync();
-    if (available) {
-      await Sharing.shareAsync(path, {
-        mimeType: 'application/json',
-        dialogTitle: 'Export Tamil Bible backup',
+
+  // 2. Next, save into the device's public DCIM/SelahBible/${dateFolder}/ folder on Android
+  if (Platform.OS === 'android') {
+    let publicSaved = false;
+
+    // Step A (Direct Public DCIM Path)
+    try {
+      const publicDir = `file:///storage/emulated/0/DCIM/SelahBible/${dateFolder}`;
+      await FileSystem.makeDirectoryAsync(publicDir, { intermediates: true });
+      await FileSystem.writeAsStringAsync(`${publicDir}/${fileName}`, backupJsonString, {
+        encoding: FileSystem.EncodingType.UTF8,
       });
+      publicSaved = true;
+    } catch {
+      // Direct write restricted by Android Scoped Storage -> fallback to Step B
     }
+
+    // Step B (Android Scoped Storage SAF into DCIM)
+    if (!publicSaved && FileSystem.StorageAccessFramework) {
+      try {
+        let dcimUri = await AsyncStorage.getItem('@selah_dcim_saf_uri');
+        let valid = false;
+        if (dcimUri) {
+          try {
+            await FileSystem.StorageAccessFramework.readDirectoryAsync(dcimUri);
+            valid = true;
+          } catch {
+            valid = false;
+          }
+        }
+        if (!valid) {
+          const perm = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(
+            'content://com.android.externalstorage.documents/document/primary%3ADCIM',
+          );
+          if (perm.granted) {
+            dcimUri = perm.directoryUri;
+            await AsyncStorage.setItem('@selah_dcim_saf_uri', dcimUri);
+            valid = true;
+          }
+        }
+        if (valid && dcimUri) {
+          const appFolderUri = await findOrCreateSafDirectory(dcimUri, 'SelahBible');
+          const dateFolderUri = await findOrCreateSafDirectory(appFolderUri, dateFolder);
+          const safFileUri = await FileSystem.StorageAccessFramework.createFileAsync(
+            dateFolderUri,
+            fileName,
+            'application/json',
+          );
+          await FileSystem.StorageAccessFramework.writeAsStringAsync(safFileUri, backupJsonString, {
+            encoding: FileSystem.EncodingType.UTF8,
+          });
+          publicSaved = true;
+        }
+      } catch {
+        // Scoped storage error handled; local copy is already securely written
+      }
+    }
+  } else if (Platform.OS === 'ios' && Sharing.isAvailableAsync) {
+    try {
+      const available = await Sharing.isAvailableAsync();
+      if (available) {
+        await Sharing.shareAsync(localPath, {
+          mimeType: 'application/json',
+          dialogTitle: 'Export Selah Bible Backup',
+        });
+      }
+    } catch {}
   }
-  return path;
+
+  return {
+    success: true,
+    fileName,
+    displayPath,
+    dateFolder,
+    humanReadablePath,
+    localPath,
+  };
 }
 
 // ---------------------------------------------------------------------------
-// Restore
+// Restore & Sandbox-Safe Reading
 // ---------------------------------------------------------------------------
+
+/**
+ * 4-stage sandbox-safe URI reader:
+ * Stage 1: Native fetch() stream reader (bypasses ExponentFileSystem sandbox check in Expo Go & APK)
+ * Stage 2: XMLHttpRequest local file/content reader
+ * Stage 3: StorageAccessFramework ContentResolver reader
+ * Stage 4: Standard FileSystem fallback
+ */
+export async function readPickedBackupUri(uri: string): Promise<string> {
+  const isLikelyJson = (str: string): boolean => {
+    const trimmed = str.replace(/^﻿/, '').trim();
+    return trimmed.startsWith('{');
+  };
+
+  // Stage 1: Native fetch() stream reader (bypasses ExponentFileSystem sandbox check in Expo Go & APK)
+  try {
+    const response = await fetch(uri);
+    if (response.ok) {
+      const text = await response.text();
+      if (text && isLikelyJson(text)) return text.replace(/^﻿/, '');
+    }
+  } catch {}
+
+  // Stage 2: XMLHttpRequest local file/content reader
+  try {
+    const text = await new Promise<string>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.onload = () => resolve(xhr.responseText);
+      xhr.onerror = () => reject(new Error('XHR read failed'));
+      xhr.responseType = 'text';
+      xhr.open('GET', uri, true);
+      xhr.send(null);
+    });
+    if (text && isLikelyJson(text)) return text.replace(/^﻿/, '');
+  } catch {}
+
+  // Stage 3: StorageAccessFramework ContentResolver reader
+  if (Platform.OS === 'android' && FileSystem.StorageAccessFramework) {
+    try {
+      const text = await FileSystem.StorageAccessFramework.readAsStringAsync(uri, {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      if (text && isLikelyJson(text)) return text.replace(/^﻿/, '');
+    } catch {}
+  }
+
+  // Stage 4: Standard FileSystem fallback
+  return await FileSystem.readAsStringAsync(uri, {
+    encoding: FileSystem.EncodingType.UTF8,
+  });
+}
 
 /** Basic shape + per-table row validation before touching user data. */
 export function validateBackupFile(payload: unknown): BackupFile {
@@ -189,8 +389,10 @@ export function validateBackupFile(payload: unknown): BackupFile {
     throw new Error('This file is not a Tamil Bible App backup.');
   }
   const candidate = payload as Partial<BackupFile>;
+  const validApps = ['TamilBibleApp', 'SelahBible', 'SelahBibleApp'];
   if (
-    candidate.app !== 'TamilBibleApp' ||
+    !candidate.app ||
+    !validApps.includes(candidate.app) ||
     !candidate.tables ||
     typeof candidate.tables !== 'object'
   ) {
@@ -199,7 +401,7 @@ export function validateBackupFile(payload: unknown): BackupFile {
   for (const name of TABLE_NAMES) {
     const rows = (candidate.tables as unknown as Record<string, unknown>)[name];
     if (rows === undefined && OPTIONAL_TABLES.includes(name)) {
-      // v1 backups: v2 tables default to empty on restore.
+      // v1 backups: optional tables default to empty on restore.
       continue;
     }
     if (!Array.isArray(rows)) {
@@ -233,7 +435,7 @@ function resyncAutoincrementSequences(): void {
 }
 
 /**
- * Replace the six tables with the backup contents inside a single transaction.
+ * Replace tables with the backup contents inside a single transaction.
  * Foreign keys are respected by deleting blocks before their messages.
  */
 export function restoreBackup(backup: BackupFile): RestoreResult {
@@ -244,6 +446,7 @@ export function restoreBackup(backup: BackupFile): RestoreResult {
     daily_devotions: 0,
     prayer_points: 0,
     reading_progress: 0,
+    verse_read_progress: 0,
     daily_entries: 0,
     daily_verses: 0,
     reading_progress_v2: 0,
@@ -258,6 +461,7 @@ export function restoreBackup(backup: BackupFile): RestoreResult {
     db.runSync('DELETE FROM daily_verses;');
     db.runSync('DELETE FROM daily_devotions;');
     db.runSync('DELETE FROM prayer_points;');
+    db.runSync('DELETE FROM verse_read_progress;');
     db.runSync('DELETE FROM reading_progress;');
     db.runSync('DELETE FROM reading_progress_v2;');
 
@@ -290,35 +494,108 @@ export function restoreBackup(backup: BackupFile): RestoreResult {
     resyncAutoincrementSequences();
   });
 
-  return { counts, total: TABLE_NAMES.reduce((sum, name) => sum + counts[name], 0) };
+  notifyProgressUpdated();
+
+  return { counts, total: TABLE_NAMES.reduce((sum, name) => sum + (counts[name] ?? 0), 0) };
 }
 
 /** Restore from an arbitrary JSON backup string (throws on invalid content). */
 export function restoreBackupFromString(raw: string): RestoreResult {
   let payload: unknown;
   try {
-    payload = JSON.parse(raw);
+    const cleaned = raw.replace(/^﻿/, '').trim();
+    payload = JSON.parse(cleaned);
   } catch {
     throw new Error('Could not read the backup file (invalid JSON).');
   }
   return restoreBackup(validateBackupFile(payload));
 }
 
+/** Restore from any URI (file://, content://, etc.) using sandbox-safe reader. */
+export async function restoreBackupFromUri(uri: string): Promise<RestoreResult> {
+  const raw = await readPickedBackupUri(uri);
+  return restoreBackupFromString(raw);
+}
+
 /**
- * Open the system document picker and restore whatever JSON backup the user
- * selects. Returns the row counts, or null when the picker was dismissed.
+ * Open system document picker and restore JSON backup.
+ * Uses copyToCacheDirectory: false to prevent Expo Go sandbox errors.
  */
 export async function restoreBackupFromPicker(): Promise<RestoreResult | null> {
-  const result = await DocumentPicker.getDocumentAsync({
-    type: ['application/json', 'text/plain', 'application/octet-stream'],
-    copyToCacheDirectory: true,
-  });
+  let result: DocumentPicker.DocumentPickerResult;
+  try {
+    result = await DocumentPicker.getDocumentAsync({
+      type: ['application/json', '*/*'],
+      copyToCacheDirectory: false,
+    });
+  } catch {
+    result = await DocumentPicker.getDocumentAsync({
+      type: ['application/json', '*/*'],
+      copyToCacheDirectory: true,
+    });
+  }
+
   if (result.canceled) return null;
   const asset = result.assets?.[0];
-  if (!asset) return null;
+  if (!asset?.uri) return null;
 
-  const raw = await FileSystem.readAsStringAsync(asset.uri, {
-    encoding: FileSystem.EncodingType.UTF8,
-  });
+  const raw = await readPickedBackupUri(asset.uri);
   return restoreBackupFromString(raw);
+}
+
+/**
+ * Scan `${FileSystem.documentDirectory}DCIM/SelahBible/` for saved backups.
+ */
+export async function listLocalBackups(): Promise<SavedBackupItem[]> {
+  const items: SavedBackupItem[] = [];
+  const docDir = FileSystem.documentDirectory?.endsWith('/')
+    ? FileSystem.documentDirectory
+    : `${FileSystem.documentDirectory ?? ''}/`;
+  const baseDir = `${docDir}DCIM/SelahBible/`;
+
+  try {
+    const baseInfo = await FileSystem.getInfoAsync(baseDir);
+    if (!baseInfo.exists || !baseInfo.isDirectory) {
+      return [];
+    }
+
+    const entries = await FileSystem.readDirectoryAsync(baseDir);
+    for (const entry of entries) {
+      const entryUri = `${baseDir}${entry}`;
+      const entryInfo = await FileSystem.getInfoAsync(entryUri);
+      if (entryInfo.isDirectory) {
+        try {
+          const files = await FileSystem.readDirectoryAsync(`${entryUri}/`);
+          for (const file of files) {
+            if (file.toLowerCase().endsWith('.json')) {
+              const fileUri = `${entryUri}/${file}`;
+              const fileInfo = await FileSystem.getInfoAsync(fileUri);
+              items.push({
+                uri: fileUri,
+                fileName: file,
+                dateFolder: entry,
+                displayPath: `DCIM/SelahBible/${entry}/${file}`,
+                size: fileInfo.exists && !fileInfo.isDirectory ? fileInfo.size : undefined,
+                modificationTime: fileInfo.exists && !fileInfo.isDirectory ? fileInfo.modificationTime : undefined,
+              });
+            }
+          }
+        } catch {}
+      } else if (entry.toLowerCase().endsWith('.json')) {
+        items.push({
+          uri: entryUri,
+          fileName: entry,
+          dateFolder: '',
+          displayPath: `DCIM/SelahBible/${entry}`,
+          size: entryInfo.exists && !entryInfo.isDirectory ? entryInfo.size : undefined,
+          modificationTime: entryInfo.exists && !entryInfo.isDirectory ? entryInfo.modificationTime : undefined,
+        });
+      }
+    }
+  } catch {
+    return [];
+  }
+
+  items.sort((a, b) => (b.modificationTime ?? 0) - (a.modificationTime ?? 0) || b.fileName.localeCompare(a.fileName));
+  return items;
 }

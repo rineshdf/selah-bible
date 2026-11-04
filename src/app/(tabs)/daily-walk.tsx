@@ -35,13 +35,16 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   LayoutAnimation,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   SectionList,
+  StatusBar,
   StyleSheet,
   Text,
   TextInput,
   View,
+  useWindowDimensions,
 } from 'react-native';
 import { useFocusEffect } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -69,6 +72,7 @@ import {
   type PrayerPointRow,
 } from '@/db/database';
 import AnimatedCard from '@/components/AnimatedCard';
+import SelahAppIconSvg from '@/components/SelahAppIconSvg';
 import PremiumCalendarModal, {
   dateToIso,
   isoToDate,
@@ -79,9 +83,13 @@ import SerialBadge from '@/components/SerialBadge';
 import { ScalePressable } from '@/components/ScalePressable';
 import {
   BibleBookSvg,
+  CalendarSvg,
   ChecklistSvg,
+  ChevronLeftSvg,
+  ChevronRightSvg,
   PlusVerseSvg,
   PrayerHandsSvg,
+  RewindSvg,
   SparkleRhemaSvg,
   SunMoonSvg,
 } from '@/components/SvgIcons';
@@ -105,6 +113,8 @@ function startOfWeek(iso: string): string {
 }
 
 const WEEKDAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+/** Short weekday abbreviations for the selected-date badge (`Wed, Nov 4`). */
+const WEEKDAY_ABBRS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 /** Full weekday names for Rewind date headers, e.g. `Tuesday, Nov 3, 2026`. */
 const WEEKDAY_FULL_NAMES = [
   'Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday',
@@ -160,7 +170,9 @@ type RewindItem = {
 /** One Rewind section: all matching notes saved on one date. */
 type RewindSection = {
   date: string;
+  dateIso: string;
   dateLabel: string;
+  totalCount: number;
   data: RewindItem[];
 };
 
@@ -177,13 +189,20 @@ const REWIND_TAGS: Record<DailyEntrySection | 'prayer', string> = {
 // ---------------------------------------------------------------------------
 
 export default function DailyWalkScreen() {
-  const { theme, themeMode, toggleTheme } = useAppTheme();
-  const styles = makeStyles(theme);
+  const { theme, colors, themeMode, toggleTheme } = useAppTheme();
+  const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
+  const topInset = Math.max(insets.top, Platform.OS === 'android' ? (StatusBar.currentHeight ?? 28) : 0, 28);
+
+  const { width: screenWidth } = useWindowDimensions();
+  const H_PAD = 14;
+  const innerWidth = screenWidth - H_PAD * 2;
+  const dayGap = 6;
+  const dayCardW = Math.floor((innerWidth - dayGap * 6) / 7);
 
   const today = todayIsoDate();
   const [selectedDate, setSelectedDate] = useState<string>(() => todayIsoDate());
-  const [weekStart, setWeekStart] = useState<string>(() => startOfWeek(todayIsoDate()));
+  const weekStart = useMemo(() => startOfWeek(selectedDate), [selectedDate]);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [rewindOpen, setRewindOpen] = useState(false);
   const [savedDates, setSavedDates] = useState<string[]>([]);
@@ -191,6 +210,7 @@ export default function DailyWalkScreen() {
   const [rewindSearch, setRewindSearch] = useState('');
   const [rewindDateFilter, setRewindDateFilter] = useState<string | null>(null);
   const [rewindCalendarOpen, setRewindCalendarOpen] = useState(false);
+  const [collapsedRewindDates, setCollapsedRewindDates] = useState<Record<string, boolean>>({});
 
   /** Which accordion card is expanded (single-open at a time). */
   const [openCard, setOpenCard] = useState<CardKey | null>('rhema');
@@ -274,16 +294,18 @@ export default function DailyWalkScreen() {
     setSavedDates(getSavedDailyWalkDates());
   }, []);
 
-  /** Switching dates (chip tap / calendar): load the new day synchronously. */
+  /** Switching dates (chip tap / calendar): load the new day synchronously.
+   *  Future dates are blocked everywhere — the walk is only writable for
+   *  days up to and including today. */
   const changeDate = useCallback(
     (dateIso: string) => {
-      setWeekStart(startOfWeek(dateIso));
+      if (dateIso > todayIsoDate()) return;
       setSelectedDate(dateIso);
       loadDay(dateIso);
       setCalendarOpen(false);
       setRewindOpen(false);
     },
-    [loadDay, setCalendarOpen, setSelectedDate, setWeekStart, setRewindOpen],
+    [loadDay, setCalendarOpen, setSelectedDate, setRewindOpen],
   );
 
   // First paint: hydrate rows for today (deferred so the effect body never
@@ -313,10 +335,9 @@ export default function DailyWalkScreen() {
 
   // --- Accordion -------------------------------------------------------------
 
-  /** Expand one card and collapse the others, animated natively. */
+  /** Expand one card and collapse the others. */
   const toggleCard = useCallback(
     (key: CardKey) => {
-      animateLayout();
       setOpenCard((current) => (current === key ? null : key));
     },
     [setOpenCard],
@@ -328,7 +349,6 @@ export default function DailyWalkScreen() {
     (section: DailyEntrySection) => {
       const text = newSectionText[section].trim();
       if (!text) return;
-      animateLayout();
       addDailyEntry({ entry_date: selectedDate, section, content: text });
       setNewSectionText((previous) => ({ ...previous, [section]: '' }));
       setEntries(getDailyEntriesForDate(selectedDate));
@@ -359,7 +379,6 @@ export default function DailyWalkScreen() {
 
   const removeEntry = useCallback(
     (entry: DailyEntryRow) => {
-      animateLayout();
       deleteDailyEntry(entry.id, entry.entry_date, entry.section);
       setEntries(getDailyEntriesForDate(selectedDate));
       setSelectedEntryId(null);
@@ -580,15 +599,6 @@ export default function DailyWalkScreen() {
 
   // --- Rewind Past Days archive + two-row header title -----------------------
 
-  /** `Daily Walk • Today, Nov 3` (weekday + month variants on other dates). */
-  const headerTitle = useMemo(() => {
-    const date = isoToDate(selectedDate);
-    const label = selectedDate === today
-      ? `Today, ${MONTH_ABBRS[date.getMonth()]} ${date.getDate()}`
-      : `${WEEKDAY_FULL_NAMES[date.getDay()]}, ${MONTH_ABBRS[date.getMonth()]} ${date.getDate()}`;
-    return `Daily Walk • ${label}`;
-  }, [selectedDate, today]);
-
   /**
    * Date-grouped archive backing Rewind Past Days: every saved day holds its
    * serial points, legacy verse cards and prayer points, filtered by the live
@@ -649,99 +659,177 @@ export default function DailyWalkScreen() {
       const dateObj = isoToDate(date);
       sections.push({
         date,
+        dateIso: date,
         dateLabel: `${WEEKDAY_FULL_NAMES[dateObj.getDay()]}, ${MONTH_ABBRS[dateObj.getMonth()]} ${dateObj.getDate()}, ${dateObj.getFullYear()}`,
+        totalCount: matches.length,
         data: matches,
       });
     }
     return sections;
   }, [savedDates, rewindDateFilter, rewindSearch]);
+  const rewindDateGroups = rewindSections;
   const rewindItemTotal = rewindSections.reduce((sum, section) => sum + section.data.length, 0);
 
-  return (
-    <View style={[styles.screen, { backgroundColor: theme.background, paddingTop: insets.top }]}>
-      {/* Row 1: `Daily Walk • Today, Nov 3` title + theme toggle */}
-      <View style={styles.headerRowTop}>
-        <Text style={styles.headerTitle}>{headerTitle}</Text>
-        <ScalePressable
-          style={styles.themeToggle}
-          onPress={toggleTheme}
-          accessibilityRole="button"
-          accessibilityLabel="Toggle dark or light theme"
-        >
-          <SunMoonSvg isDark={themeMode === 'dark'} size={20} color={theme.primary} />
-        </ScalePressable>
-      </View>
-      {/* Row 2: Rewind + Calendar pills, and a Today chip when off today */}
-      <View style={styles.headerRowNav}>
-        <ScalePressable
-          style={styles.headerPillPrimary}
-          onPress={() => {
-            refreshSavedDates();
-            setRewindOpen(true);
-          }}
-          accessibilityRole="button"
-          accessibilityLabel="Open saved past days"
-        >
-          <Text style={styles.headerPillPrimaryText}>↺ Rewind</Text>
-        </ScalePressable>
-        <ScalePressable
-          style={styles.headerPillSecondary}
-          onPress={() => setCalendarOpen(true)}
-          accessibilityRole="button"
-          accessibilityLabel="Open calendar"
-        >
-          <Text style={styles.headerPillSecondaryText}>🗓 Calendar</Text>
-        </ScalePressable>
-        {selectedDate !== today ? (
-          <ScalePressable
-            style={styles.todayChip}
-            onPress={() => changeDate(todayIsoDate())}
-            accessibilityRole="button"
-            accessibilityLabel="Jump back to today"
-          >
-            <Text style={styles.todayChipText}>Today</Text>
-          </ScalePressable>
-        ) : null}
-      </View>
+  const renderedRewindSections = useMemo(() => {
+    return rewindSections.map((section) => ({
+      ...section,
+      data: collapsedRewindDates[section.dateIso] ? [] : section.data,
+    }));
+  }, [rewindSections, collapsedRewindDates]);
 
-      {/* Compact horizontal 7-day strip — fixed height, no tall vertical bars */}
-      <View style={styles.strip}>
-        <View style={styles.stripRow}>
-          {weekDates(weekStart).map((dateIso) => {
-            const active = dateIso === selectedDate;
-            const isToday = dateIso === today;
-            const date = isoToDate(dateIso);
-            return (
-              <ScalePressable
-                key={dateIso}
-                style={[styles.dayChip, active ? styles.dayChipActive : null]}
-                onPress={() => changeDate(dateIso)}
-                accessibilityRole="button"
-                accessibilityLabel={`Select date ${dateIso}`}
-              >
-                <Text
-                  style={[
-                    styles.dayChipWeekday,
-                    active ? styles.dayChipTextActive : null,
-                    !active && isToday ? styles.dayChipWeekdayToday : null,
-                  ]}
-                >
-                  {WEEKDAY_NAMES[(date.getDay() + 6) % 7]}
-                </Text>
-                <Text
-                  style={[
-                    styles.dayChipNumber,
-                    active ? styles.dayChipTextActive : null,
-                    !active && isToday ? styles.dayChipNumberToday : null,
-                  ]}
-                >
-                  {date.getDate()}
-                </Text>
-              </ScalePressable>
-            );
-          })}
+  /** Row-1 badge label: `Today • Wed, Nov 4` or `Mon, Nov 2, 2026`. */
+  const dateBadgeLabel = useMemo(() => {
+    const date = isoToDate(selectedDate);
+    if (selectedDate === today) {
+      return `Today • ${WEEKDAY_ABBRS[date.getDay()]}, ${MONTH_ABBRS[date.getMonth()]} ${date.getDate()}`;
+    }
+    return `${WEEKDAY_ABBRS[date.getDay()]}, ${MONTH_ABBRS[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`;
+  }, [selectedDate, today]);
+
+  /** Week navigation can never move past the current week. */
+  const weekContainsToday = weekDates(weekStart).includes(today);
+
+  return (
+    <View style={[styles.screen, { backgroundColor: colors.background, paddingTop: topInset + 8 }]}>
+      {/* FIX 5 — one unified header container: Rows 1-3 all share the exact
+          14px left/right edges of the accordion cards below. */}
+      <View style={styles.headerContainer}>
+        {/* Row 1 — Title & Theme Toggle */}
+        <View style={[styles.titleRow, { paddingHorizontal: H_PAD }]}>
+          <View style={styles.titleMeta}>
+            <View style={styles.titleIconRow}>
+              <SelahAppIconSvg size={22} color={theme.primary} />
+              <Text style={styles.headerTitle}>Daily Walk</Text>
+            </View>
+            <ScalePressable
+              style={styles.dateBadge}
+              onPress={() => setCalendarOpen(true)}
+              android_ripple={null}
+              accessibilityRole="button"
+              accessibilityLabel={`Selected date ${dateBadgeLabel}. Open calendar`}
+            >
+              <Text numberOfLines={1} style={styles.dateBadgeText}>
+                <CalendarSvg size={14} color={theme.primary} /> {dateBadgeLabel}
+              </Text>
+            </ScalePressable>
+          </View>
+          <ScalePressable
+            style={styles.themeToggle}
+            onPress={toggleTheme}
+            android_ripple={null}
+            accessibilityRole="button"
+            accessibilityLabel="Toggle dark or light theme"
+          >
+            <SunMoonSvg isDark={themeMode === 'dark'} size={20} color={theme.primary} />
+          </ScalePressable>
         </View>
-      </View>
+
+        {/* Row 2 — Full-Size 50/50 Rewind & Calendar Buttons */}
+        <View style={styles.actionBar}>
+          <ScalePressable
+            style={styles.navButtonRewind}
+            onPress={() => {
+              refreshSavedDates();
+              setRewindOpen(true);
+            }}
+            accessibilityRole="button"
+            accessibilityLabel="Open saved past days"
+          >
+            <RewindSvg size={18} color="#FFFFFF" />
+            <Text style={styles.navButtonRewindText}>Rewind</Text>
+          </ScalePressable>
+          <ScalePressable
+            style={styles.navButtonCalendar}
+            onPress={() => setCalendarOpen(true)}
+            accessibilityRole="button"
+            accessibilityLabel="Open calendar"
+          >
+            <CalendarSvg size={18} color={colors.primary} />
+            <Text style={styles.navButtonCalendarText}>Calendar</Text>
+          </ScalePressable>
+        </View>
+
+        {/* Row 3 — Sleek Week Switcher Bar Using Vector Chevron Icons */}
+        <View style={[styles.weekSwitcher, { width: innerWidth, marginHorizontal: H_PAD }]}>
+          <ScalePressable
+            style={styles.weekSwitcherArrow}
+            onPress={() => changeDate(isoShifted(selectedDate, -7))}
+            accessibilityRole="button"
+            accessibilityLabel="Previous week"
+          >
+            <ChevronLeftSvg size={20} color={theme.text} />
+          </ScalePressable>
+          <View style={styles.weekSwitcherCenter}>
+            <Text style={styles.weekSwitcherLabel}>{dateBadgeLabel}</Text>
+            {selectedDate !== today ? (
+              <ScalePressable
+                style={styles.todayPill}
+                onPress={() => changeDate(today)}
+                accessibilityRole="button"
+                accessibilityLabel="Jump to today"
+              >
+                <Text style={styles.todayPillText}>↺ Today</Text>
+              </ScalePressable>
+            ) : null}
+          </View>
+          <ScalePressable
+            style={[styles.weekSwitcherArrow, weekContainsToday ? styles.weekSwitcherArrowDisabled : null]}
+            onPress={() => {
+              const nextDate = isoShifted(selectedDate, 7);
+              changeDate(nextDate <= today ? nextDate : today);
+            }}
+            disabled={weekContainsToday}
+            accessibilityRole="button"
+            accessibilityLabel="Next week"
+          >
+            <ChevronRightSvg size={20} color={theme.text} />
+          </ScalePressable>
+        </View>
+
+          {/* Row 4 — Full-Width 7-Day Week Cards */}
+          <View style={[styles.strip, { width: innerWidth, marginHorizontal: H_PAD }]}>
+            {weekDates(weekStart).map((dateIso) => {
+              const active = dateIso === selectedDate;
+              const isToday = dateIso === today;
+              const isFuture = dateIso > today;
+              const date = isoToDate(dateIso);
+              return (
+                <ScalePressable
+                  key={dateIso}
+                  style={[
+                    styles.dayCard,
+                    { width: dayCardW },
+                    active ? styles.dayCardActive : null,
+                    isFuture ? styles.dayCardDisabled : null,
+                  ]}
+                  onPress={() => changeDate(dateIso)}
+                  disabled={isFuture}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Select date ${dateIso}`}
+                >
+                  <Text
+                    style={[
+                      styles.dayCardWeekday,
+                      active ? styles.dayCardTextActive : null,
+                      !active && isToday ? styles.dayCardWeekdayToday : null,
+                    ]}
+                  >
+                    {WEEKDAY_NAMES[(date.getDay() + 6) % 7]}
+                  </Text>
+                  <Text
+                    style={[
+                      styles.dayCardNumber,
+                      active ? styles.dayCardTextActive : null,
+                      !active && isToday ? styles.dayCardNumberToday : null,
+                    ]}
+                  >
+                    {date.getDate()}
+                  </Text>
+                </ScalePressable>
+              );
+            })}
+          </View>
+        </View>
 
       <ScrollView
         contentContainerStyle={styles.cards}
@@ -1115,12 +1203,17 @@ export default function DailyWalkScreen() {
       </ScrollView>
 
       {/* Rewind Past Days — Highlights-style full-screen archive */}
-      <Modal visible={rewindOpen} animationType="slide" onRequestClose={() => setRewindOpen(false)}>
-        <View style={[styles.rewindScreen, { backgroundColor: theme.background, paddingTop: insets.top }]}>
+      <Modal
+        visible={rewindOpen}
+        animationType="fade"
+        statusBarTranslucent={true}
+        onRequestClose={() => setRewindOpen(false)}
+      >
+        <View style={[styles.rewindScreen, { backgroundColor: colors.background }]}>
           {/* Header: title + count badge · calendar filter · close */}
-          <View style={styles.rewindHeader}>
+          <View style={[styles.rewindHeader, { paddingTop: topInset + 8, backgroundColor: colors.background }]}>
             <View style={styles.rewindHeaderTitleWrap}>
-              <Text style={styles.rewindTitle}>Rewind Past Days</Text>
+              <Text numberOfLines={1} style={styles.rewindTitle}>Rewind Past Days</Text>
               <View style={styles.rewindCountBadge}>
                 <Text style={styles.rewindCountText}>{rewindItemTotal}</Text>
               </View>
@@ -1135,7 +1228,7 @@ export default function DailyWalkScreen() {
                 accessibilityRole="button"
                 accessibilityLabel="Filter the archive by date"
               >
-                <Text style={styles.rewindCalendarButtonGlyph}>🗓</Text>
+                <CalendarSvg size={16} color={rewindDateFilter ? theme.primaryForeground : colors.primary} />
                 <Text
                   style={[
                     styles.rewindCalendarButtonText,
@@ -1176,6 +1269,39 @@ export default function DailyWalkScreen() {
             ) : null}
           </View>
 
+          {/* Clean header control bar: Past Journal Days (N) + Expand All / Collapse All */}
+          <View style={styles.rewindControlBar}>
+            <Text style={styles.rewindControlBarLabel}>
+              Past Journal Days ({rewindDateGroups.length})
+            </Text>
+            <View style={styles.rewindControlBarActions}>
+              <ScalePressable
+                style={styles.rewindPillButton}
+                onPress={() => {
+                  setCollapsedRewindDates({});
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Expand all past days"
+              >
+                <Text style={styles.rewindPillButtonText}>Expand All</Text>
+              </ScalePressable>
+              <ScalePressable
+                style={styles.rewindPillButton}
+                onPress={() => {
+                  const next: Record<string, boolean> = {};
+                  rewindDateGroups.forEach((g) => {
+                    next[g.dateIso] = true;
+                  });
+                  setCollapsedRewindDates(next);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Collapse all past days"
+              >
+                <Text style={styles.rewindPillButtonText}>Collapse All</Text>
+              </ScalePressable>
+            </View>
+          </View>
+
           {/* Single-date calendar filter chip */}
           {rewindDateFilter ? (
             <ScalePressable
@@ -1191,25 +1317,48 @@ export default function DailyWalkScreen() {
             </ScalePressable>
           ) : null}
 
-          {/* Date-grouped archive list with `Open Day ›` on every header */}
+          {/* Date-grouped archive list with collapsible accordion headers */}
           <SectionList
             style={styles.rewindList}
             contentContainerStyle={styles.rewindListContent}
-            sections={rewindSections}
+            sections={renderedRewindSections}
+            extraData={collapsedRewindDates}
             keyExtractor={(item) => `${item.kind}-${item.id}`}
-            renderSectionHeader={({ section }) => (
-              <View style={styles.rewindSectionHeader}>
-                <Text style={styles.rewindSectionDate}>{section.dateLabel}</Text>
-                <ScalePressable
-                  style={styles.rewindOpenDayButton}
-                  onPress={() => changeDate(section.date)}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Open day ${section.dateLabel}`}
-                >
-                  <Text style={styles.rewindOpenDayText}>Open Day ›</Text>
-                </ScalePressable>
-              </View>
-            )}
+            renderSectionHeader={({ section }) => {
+              const isCollapsed = Boolean(collapsedRewindDates[section.dateIso]);
+              return (
+                <View style={styles.rewindSectionHeader}>
+                  <ScalePressable
+                    style={styles.rewindSectionAccordion}
+                    onPress={() => {
+                      setCollapsedRewindDates((prev) => ({
+                        ...prev,
+                        [section.dateIso]: !prev[section.dateIso],
+                      }));
+                    }}
+                    accessibilityRole="button"
+                    accessibilityState={{ expanded: !isCollapsed }}
+                    accessibilityLabel={`${isCollapsed ? 'Expand' : 'Collapse'} ${section.dateLabel}`}
+                  >
+                    <Text style={styles.rewindAccordionChevron}>{isCollapsed ? '▸' : '▾'}</Text>
+                    <Text numberOfLines={1} style={styles.rewindSectionDate}>
+                      {section.dateLabel}
+                    </Text>
+                    <View style={styles.rewindGroupBadge}>
+                      <Text style={styles.rewindGroupBadgeText}>{section.totalCount}</Text>
+                    </View>
+                  </ScalePressable>
+                  <ScalePressable
+                    style={styles.rewindOpenDayButton}
+                    onPress={() => changeDate(section.date)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Open day ${section.dateLabel}`}
+                  >
+                    <Text style={styles.rewindOpenDayText}>Open Day ›</Text>
+                  </ScalePressable>
+                </View>
+              );
+            }}
             renderItem={({ item, index }) => (
               <RewindItemCard item={item} index={index} theme={theme} styles={styles} />
             )}
@@ -1316,7 +1465,7 @@ function AccordionCard({
 }) {
   return (
     <AnimatedCard style={styles.card} delay={delay}>
-      <Pressable
+      <ScalePressable
         style={styles.cardHeaderRow}
         onPress={onToggle}
         accessibilityRole="button"
@@ -1329,7 +1478,7 @@ function AccordionCard({
           <Text style={styles.cardBadgeText}>{badge}</Text>
         </View>
         <Text style={styles.cardChevron}>{open ? '▾' : '›'}</Text>
-      </Pressable>
+      </ScalePressable>
       {open ? <View style={styles.cardBody}>{children}</View> : null}
     </AnimatedCard>
   );
@@ -1691,128 +1840,219 @@ function makeStyles(theme: AppTheme) {
   };
   return StyleSheet.create({
     screen: { flex: 1 },
-    // Two-row custom header: Row 1 title + theme toggle, Row 2 action pills
-    headerRowTop: {
+    // Unified header container; rows carry their own 14px horizontal
+    // insets so their edges match the accordion cards below exactly.
+    headerContainer: {
+      width: '100%',
+      marginBottom: 2,
+    },
+    // Row 1: title + date badge on the left (flex 1, gap 10), theme
+    // toggle flush right; no floating center pill.
+    titleRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginBottom: 10,
+    },
+    titleMeta: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: 10,
-      paddingHorizontal: 14,
-      paddingTop: 8,
-    },
-    headerTitle: {
       flex: 1,
-      color: theme.text,
-      fontSize: 17,
-      fontWeight: '800',
-      lineHeight: 24,
+      minWidth: 0,
     },
-    themeToggle: {
-      width: 34,
-      height: 34,
-      borderRadius: 999,
-      borderWidth: 1,
-      borderColor: theme.border,
-      backgroundColor: theme.surfaceMuted,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    headerRowNav: {
+    titleIconRow: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: 8,
-      paddingHorizontal: 14,
-      paddingTop: 6,
     },
-    headerPillPrimary: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: 5,
-      borderRadius: 16,
-      borderWidth: 1,
-      borderColor: theme.primary,
-      backgroundColor: theme.primary,
+    headerTitle: {
+      color: theme.text,
+      fontSize: 22,
+      fontWeight: '800',
+      lineHeight: 28,
+      flexShrink: 0,
+    },
+    // Tappable date badge next to the title (no `flex 1` stretch).
+    dateBadge: {
+      flexShrink: 1,
+      minWidth: 0,
       paddingHorizontal: 12,
-      paddingVertical: 7,
-    },
-    headerPillPrimaryText: {
-      color: theme.primaryForeground,
-      fontSize: 13,
-      fontWeight: '700',
-      lineHeight: 20,
-    },
-    headerPillSecondary: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: 5,
-      borderRadius: 16,
+      paddingVertical: 6,
+      borderRadius: 10,
       borderWidth: 1,
-      borderColor: theme.primary,
-      backgroundColor: theme.surfaceMuted,
-      paddingHorizontal: 12,
-      paddingVertical: 7,
+      borderColor: theme.border,
+      backgroundColor: theme.surface,
+      alignItems: 'center',
+      justifyContent: 'center',
     },
-    headerPillSecondaryText: {
+    dateBadgeText: {
       color: theme.primary,
       fontSize: 13,
       fontWeight: '700',
-      lineHeight: 20,
-    },
-    todayChip: {
-      marginLeft: 'auto',
-      borderRadius: 999,
-      borderWidth: 1,
-      borderColor: theme.primary,
-      backgroundColor: theme.primary,
-      paddingHorizontal: 12,
-      paddingVertical: 6,
-    },
-    todayChipText: {
-      color: theme.primaryForeground,
-      fontSize: 12,
-      fontWeight: '800',
       lineHeight: 18,
+      textAlign: 'center',
     },
-    strip: {
-      backgroundColor: theme.surface,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: theme.border,
-    },
-    // Fixed compact 7-day row
-    stripRow: {
-      flexDirection: 'row',
-      justifyContent: 'space-between',
-      alignItems: 'center',
-      paddingHorizontal: 12,
-      marginVertical: 8,
-      flexGrow: 0,
-    },
-    dayChip: {
-      flex: 1,
-      height: 56,
-      maxHeight: 56,
-      marginHorizontal: 3,
-      borderRadius: 12,
-      paddingVertical: 6,
+    themeToggle: {
+      width: 38,
+      height: 38,
+      borderRadius: 19,
+      borderWidth: 1,
+      borderColor: theme.border,
+      backgroundColor: theme.surfaceMuted,
       alignItems: 'center',
       justifyContent: 'center',
-      gap: 2,
+      flexShrink: 0,
+    },
+    // Row 2: Full-Size 50/50 Rewind & Calendar Buttons
+    actionBar: {
+      width: '100%',
+      paddingHorizontal: 14,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 10,
+      height: 44,
+      minHeight: 44,
+      marginTop: 10,
+      marginBottom: 10,
+    },
+    navButtonRewind: {
+      flex: 1,
+      height: 44,
+      minHeight: 44,
+      maxWidth: '48.5%',
+      borderRadius: 13,
+      backgroundColor: theme.primary,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+      paddingHorizontal: 14,
+      flexShrink: 0,
+    },
+    navButtonRewindText: {
+      color: '#FFFFFF',
+      fontSize: 15,
+      fontWeight: '800',
+      includeFontPadding: false,
+      flexShrink: 0,
+    },
+    navButtonCalendar: {
+      flex: 1,
+      height: 44,
+      minHeight: 44,
+      maxWidth: '48.5%',
+      borderRadius: 13,
+      borderWidth: 1.5,
+      borderColor: theme.primary,
+      backgroundColor: theme.surface,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+      paddingHorizontal: 14,
+      flexShrink: 0,
+    },
+    navButtonCalendarText: {
+      color: theme.primary,
+      fontSize: 15,
+      fontWeight: '800',
+      includeFontPadding: false,
+      flexShrink: 0,
+    },
+    // Row 3: Sleek Week Switcher Bar Using Vector Chevron Icons
+    weekSwitcher: {
+      height: 42,
+      minHeight: 42,
+      marginBottom: 8,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      backgroundColor: theme.surface,
+      borderRadius: 11,
+      paddingHorizontal: 6,
+      borderWidth: 1,
+      borderColor: theme.border,
+    },
+    weekSwitcherArrow: {
+      width: 44,
+      height: 34,
+      borderRadius: 8,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    weekSwitcherArrowDisabled: { opacity: 0.28 },
+    weekSwitcherCenter: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 8,
+    },
+    weekSwitcherLabel: {
+      color: theme.text,
+      fontSize: 13.5,
+      fontWeight: '700',
+      textAlign: 'center',
+    },
+    todayPill: {
+      borderRadius: 12,
+      backgroundColor: theme.primary,
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+    },
+    todayPillText: {
+      color: '#FFFFFF',
+      fontSize: 11.5,
+      fontWeight: '800',
+    },
+    // Row 4: 7 exact-width day cards span the full inner width.
+    strip: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      height: 64,
+      minHeight: 64,
+      marginBottom: 14,
+    },
+    dayCard: {
+      height: 62,
+      minHeight: 62,
+      borderRadius: 12,
+      alignItems: 'center',
+      justifyContent: 'center',
       borderWidth: 1,
       borderColor: theme.border,
       backgroundColor: theme.surfaceMuted,
     },
-    dayChipActive: {
+    dayCardActive: {
       backgroundColor: theme.primary,
       borderColor: theme.primary,
     },
-    dayChipWeekday: { color: theme.textMuted, fontSize: 11, fontWeight: '700' },
-    dayChipNumber: { color: theme.text, fontSize: 16, fontWeight: '700' },
-    dayChipTextActive: { color: theme.primaryForeground },
-    dayChipWeekdayToday: { color: theme.primary },
-    dayChipNumberToday: { color: theme.primary },
+    dayCardDisabled: { opacity: 0.3 },
+    dayCardWeekday: {
+      color: theme.textMuted,
+      fontSize: 11.5,
+      fontWeight: '600',
+      includeFontPadding: false,
+    },
+    dayCardNumber: {
+      color: theme.text,
+      fontSize: 16,
+      fontWeight: '800',
+      marginTop: 2,
+      includeFontPadding: false,
+    },
+    dayCardTextActive: { color: theme.primaryForeground },
+    dayCardWeekdayToday: { color: theme.primary },
+    dayCardNumberToday: { color: theme.primary },
+    // FIX 5 — accordion cards share the exact 14px left/right edges as the
+    // header rows and the 7-day strip.
     cards: {
-      padding: 16,
-      paddingBottom: 48,
-      gap: 12,
+      paddingHorizontal: 14,
+      paddingBottom: 28,
+      gap: 10,
     },
     card: {
       borderRadius: 14,
@@ -2079,7 +2319,12 @@ function makeStyles(theme: AppTheme) {
       gap: 8,
       flexShrink: 1,
     },
-    rewindTitle: { color: theme.text, fontSize: 19, fontWeight: '800' },
+    rewindTitle: {
+      color: theme.text,
+      fontSize: 19,
+      fontWeight: '800',
+      flexShrink: 1,
+    },
     rewindCountBadge: {
       minWidth: 22,
       height: 22,
@@ -2138,6 +2383,39 @@ function makeStyles(theme: AppTheme) {
       paddingHorizontal: 14,
     },
     rewindSearchClearIcon: { color: theme.textMuted, fontSize: 15, fontWeight: '700', padding: 6 },
+    rewindControlBar: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 16,
+      paddingTop: 8,
+      paddingBottom: 8,
+    },
+    rewindControlBarLabel: {
+      color: theme.textMuted,
+      fontSize: 12,
+      fontWeight: '700',
+      textTransform: 'uppercase',
+      letterSpacing: 0.5,
+    },
+    rewindControlBarActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+    },
+    rewindPillButton: {
+      borderRadius: 999,
+      borderWidth: 1,
+      borderColor: theme.border,
+      backgroundColor: theme.surfaceMuted,
+      paddingHorizontal: 12,
+      paddingVertical: 5,
+    },
+    rewindPillButtonText: {
+      color: theme.primary,
+      fontSize: 12,
+      fontWeight: '700',
+    },
     rewindFilterChip: {
       alignSelf: 'flex-start',
       marginLeft: 16,
@@ -2164,7 +2442,36 @@ function makeStyles(theme: AppTheme) {
       gap: 8,
       paddingVertical: 8,
     },
-    rewindSectionDate: { flex: 1, color: theme.text, fontSize: 15, fontWeight: '800' },
+    rewindSectionAccordion: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      paddingVertical: 4,
+    },
+    rewindAccordionChevron: {
+      color: theme.primary,
+      fontSize: 14,
+      fontWeight: '800',
+      width: 14,
+    },
+    rewindSectionDate: { flexShrink: 1, color: theme.text, fontSize: 15, fontWeight: '800' },
+    rewindGroupBadge: {
+      minWidth: 20,
+      height: 20,
+      borderRadius: 999,
+      backgroundColor: theme.surfaceMuted,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingHorizontal: 6,
+    },
+    rewindGroupBadgeText: {
+      color: theme.textMuted,
+      fontSize: 11,
+      fontWeight: '700',
+    },
     rewindOpenDayButton: {
       borderRadius: 999,
       borderWidth: 1,

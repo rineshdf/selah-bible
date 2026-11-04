@@ -189,6 +189,18 @@ export function getHighlightStyle(colorHexOrId: string | null | undefined, isDar
   const reference = (colorHexOrId ?? '').trim();
   let id: HighlightColorId | undefined;
 
+  // Blank reference = the verse was never highlighted: return a fully
+  // transparent style with the plain body text color so readers that pass the
+  // style through unguarded can never paint a black-on-black verse in Dark
+  // Mode (and never need a null check either).
+  if (!reference) {
+    return {
+      backgroundColor: 'transparent',
+      borderColor: 'transparent',
+      textColor: isDark ? '#F1F5F9' : '#0F172A',
+    };
+  }
+
   if (reference) {
     const key = reference.toLowerCase();
     const byRawId = HIGHLIGHT_PALETTE
@@ -202,7 +214,8 @@ export function getHighlightStyle(colorHexOrId: string | null | undefined, isDar
     }
   }
 
-  const palette = paletteForId(id ?? (reference ? DEFAULT_HIGHLIGHT_ID : DEFAULT_HIGHLIGHT_ID));
+  // Unknown color refs (both here and above) resolve to the amber default.
+  const palette = paletteForId(id ?? DEFAULT_HIGHLIGHT_ID);
   return {
     backgroundColor: isDark ? palette.darkBg : palette.lightBg,
     borderColor: palette.border,

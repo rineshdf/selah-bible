@@ -3,7 +3,8 @@
  *
  * Step 1 — Select Bible Version: installed and available versions, with
  *          search and download support; defaults to the active one.
- * Step 2 — Select Book: searchable OT & NT 66-book list (Tamil + English).
+ * Step 2 — Select Book: searchable list of the version's OWN books, native
+ *          name left / English name right, with empty testaments hidden.
  * Step 3 — Select Chapter: numeric grid for the chosen book.
  * Step 4 — Select Verse(s): tap to pick any combination of verses (tapping a
  *          nearby verse ±10 grabs the whole range), preview the scripture,
@@ -16,28 +17,39 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
+  useWindowDimensions,
 } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '@/constants/ThemeContext';
-import { BIBLE_BOOKS, getBooksByTestament, getBookById, type BibleBook } from '@/constants/books';
+import {
+  getBookById,
+  getLocalizedBookName,
+  type BibleBook,
+  type VersionBookMeta,
+} from '@/constants/books';
 import {
   getActiveVersionId,
   getDownloadedVersionSummaries,
-  getBookChapterCount,
+  getVersionBooksById,
+  getVersionBooksManifest,
   loadChapterVerses,
   searchDownloadedVersionsFuzzy,
   downloadBibleVersion,
   normalizeVersionId,
   type ChapterVerse,
   type DownloadedVersionSummary,
+  type VersionBookManifestEntry,
 } from '@/db/bibleLoader';
 import { DEFAULT_VERSIONS, filterVersions, searchOnlineTranslations, type DownloadableVersion } from '@/constants/versionCatalog';
 import { PlusVerseSvg } from '@/components/SvgIcons';
+import { ScalePressable } from '@/components/ScalePressable';
 import type { AppTheme } from '@/constants/colors';
 
 export interface VersePickResult {
@@ -90,6 +102,12 @@ function combineVerseNumbers(selected: Set<number>): string {
 
 type Stage = 'version' | 'books' | 'chapters' | 'verses';
 
+/** FIX 4 — one book row: canonical book object + the version's manifest entry. */
+type PickerBookRow = {
+  book: BibleBook;
+  manifest: VersionBookManifestEntry;
+};
+
 export default function VersePickerModal({
   visible,
   onInsert,
@@ -111,8 +129,20 @@ function VersePickerBody({
   onInsert,
   onClose,
 }: Pick<VersePickerModalProps, 'onInsert' | 'onClose'>) {
+  const insets = useSafeAreaInsets();
   const { theme } = useAppTheme();
-  const styles = makeStyles(theme);
+  const styles = useMemo(() => makeStyles(theme), [theme]);
+
+  // FIX 1: dynamic 5-column chapter grid spanning the full content width.
+  const { width: screenWidth } = useWindowDimensions();
+  const gridPadding = 16;
+  const gridGap = 10;
+  const gridCols = 5;
+  const tileWidth = Math.floor(
+    (screenWidth - gridPadding * 2 - gridGap * (gridCols - 1)) / gridCols,
+  );
+  /** Header padding that keeps the header clear of the status bar with no dead gap. */
+  const modalHeaderTop = Platform.OS === 'android' ? 8 : insets.top + 6;
 
   const [stage, setStage] = useState<Stage>('version');
   const [versions, setVersions] = useState<DownloadedVersionSummary[]>([]);
@@ -136,6 +166,65 @@ function VersePickerBody({
   const loadTokenRef = useRef(0);
   /** Last tapped verse number, used to grab a contiguous ±10 range in one tap. */
   const lastTappedRef = useRef<number | null>(null);
+  /**
+   * FIX 4 — the picked version's EXACT book manifest (`null` while loading):
+   * only books the version actually carries, with its own native names and
+   * true chapter counts. No canonical 66-book fillers.
+   *
+   * Tagged with its version id so picking another version can never render the
+   * previous version's books for even one frame.
+   */
+  const [bookManifestState, setBookManifestState] = useState<{
+    versionId: string;
+    books: VersionBookManifestEntry[];
+  } | null>(null);
+  const bookManifest = useMemo(
+    () => (selectedVersion && bookManifestState &&
+      bookManifestState.versionId === normalizeVersionId(selectedVersion.id)
+      ? bookManifestState.books
+      : null),
+    [bookManifestState, selectedVersion],
+  );
+  /**
+   * FIX 2 — the picked version's books keyed by TRUE canonical id (USFM or
+   * testament-count derived), so the book list always shows the version's own
+   * native names paired with the matching canonical English names.
+   */
+  const [versionBooksById, setVersionBooksById] = useState<Record<number, VersionBookMeta>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const vid = selectedVersion?.id;
+      if (!vid) {
+        if (!cancelled) setBookManifestState(null);
+        return;
+      }
+      const manifest = await getVersionBooksManifest(vid);
+      if (!cancelled) {
+        setBookManifestState({ versionId: normalizeVersionId(vid), books: manifest });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedVersion?.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const vid = selectedVersion?.id;
+      if (!vid) {
+        if (!cancelled) setVersionBooksById({});
+        return;
+      }
+      const lookup = await getVersionBooksById(vid);
+      if (!cancelled) setVersionBooksById(lookup);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedVersion?.id]);
 
   // Load the offline version library once per open. All state updates happen
   // inside the async continuation, never synchronously in the effect body.
@@ -209,19 +298,69 @@ function VersePickerBody({
     return () => { cancelled = true; };
   }, [versionQuery]);
 
-  const filteredBooks = useMemo(() => {
-    const q = bookQuery.trim().toLowerCase();
-    if (!q) return BIBLE_BOOKS;
-    return BIBLE_BOOKS.filter(
-      (book) =>
-        book.englishName.toLowerCase().includes(q) ||
-        book.tamilName.includes(bookQuery.trim()),
-    );
-  }, [bookQuery]);
+  const localizedBook = useCallback(
+    (bookId: number) => {
+      const meta = selectedVersion
+        ? {
+            id: selectedVersion.id,
+            language: selectedVersion.languageName ?? '',
+            languageCode: selectedVersion.languageCode,
+          }
+        : null;
+      // FIX 2 — native names resolved from the version's own parsed JSON
+      // (keyed by canonical id), so an Odia NT-only Bible shows its `Hebrews`
+      // name for book 58, never an English `Psalms` fallback for position 19.
+      return getLocalizedBookName(bookId, meta, null, versionBooksById);
+    },
+    [selectedVersion, versionBooksById],
+  );
 
-  const selectedBookChapterCount = selectedBook && selectedVersion
-    ? getBookChapterCount(selectedVersion.id, selectedBook.id)
-    : selectedBook?.chaptersCount ?? 0;
+  const pickedBooks = useMemo<PickerBookRow[]>(() => {
+    if (!bookManifest) return [];
+    const rows: PickerBookRow[] = [];
+    bookManifest.forEach((manifest) => {
+      const book = getBookById(manifest.bookId);
+      if (book) rows.push({ book, manifest });
+    });
+    return rows;
+  }, [bookManifest]);
+
+  const filteredBooks = useMemo<PickerBookRow[]>(() => {
+    const q = bookQuery.trim().toLowerCase();
+    return pickedBooks.filter(({ book, manifest }) => {
+      if (!q) return true;
+      const names = localizedBook(book.id);
+      return (
+        names.primaryName.toLowerCase().includes(q) ||
+        names.secondaryName.toLowerCase().includes(q) ||
+        manifest.nativeName.toLowerCase().includes(q) ||
+        manifest.englishName.toLowerCase().includes(q) ||
+        book.englishName.toLowerCase().includes(q) ||
+        book.tamilName.includes(bookQuery.trim())
+      );
+    });
+  }, [bookQuery, localizedBook, pickedBooks]);
+
+  // FIX 4 — strict testament split driven by the manifest itself; a version
+  // with only Gospels renders NO Old Testament section.
+  const oldTestamentBooks = useMemo(
+    () => filteredBooks.filter((row) => row.manifest.testament === 'OT'),
+    [filteredBooks],
+  );
+  const newTestamentBooks = useMemo(
+    () => filteredBooks.filter((row) => row.manifest.testament === 'NT'),
+    [filteredBooks],
+  );
+
+  const selectedBookManifest = useMemo(
+    () => (selectedBook && bookManifest
+      ? bookManifest.find((entry) => entry.bookId === selectedBook.id)
+      : undefined),
+    [bookManifest, selectedBook],
+  );
+  const selectedBookChapterCount = selectedBookManifest?.chapters
+    ?? selectedBook?.chaptersCount
+    ?? 0;
 
   /** Load the chosen chapter from the chosen offline version. */
   const openChapter = useCallback(async (version: DownloadedVersionSummary, book: BibleBook, chapter: number) => {
@@ -232,9 +371,16 @@ function VersePickerBody({
     setSelectedVerses(new Set());
     lastTappedRef.current = null;
     try {
+      // Partial versions redirect an unavailable book/chapter to the first one
+      // the version actually carries — sync the picker state to what was served.
       const loaded = await loadChapterVerses(version.id, book.id, chapter);
       if (loadTokenRef.current !== token) return;
-      setVerses(loaded);
+      setVerses(loaded.verses);
+      if (loaded.actualBookId !== book.id || loaded.actualChapter !== chapter) {
+        const servedBook = getBookById(loaded.actualBookId);
+        if (servedBook) setSelectedBook(servedBook);
+        setSelectedChapter(loaded.actualChapter);
+      }
     } catch (err) {
       if (loadTokenRef.current !== token) return;
       setVerseError(
@@ -249,6 +395,11 @@ function VersePickerBody({
     if (versions.some((item) => normalizeVersionId(item.id) === normalizeVersionId(summary.id))) {
       const installed = versions.find((item) => normalizeVersionId(item.id) === normalizeVersionId(summary.id));
       setSelectedVersion(installed ?? summary);
+      // A new version means a new book list: drop the previous selection and
+      // search so the step cannot show a book this version does not carry.
+      setSelectedBook(null);
+      setSelectedChapter(1);
+      setBookQuery('');
       setStage('books');
       return;
     }
@@ -264,6 +415,9 @@ function VersePickerBody({
       if (!installed) return;
       setVersions(summaries);
       setSelectedVersion(installed);
+      setSelectedBook(null);
+      setSelectedChapter(1);
+      setBookQuery('');
       setStage('books');
     }).catch((error: unknown) => {
       setVersionSearchError(error instanceof Error ? error.message : 'Could not download this Bible.');
@@ -379,8 +533,13 @@ function VersePickerBody({
 
   return (
     <View style={[styles.screen, { backgroundColor: theme.background }]}>
-      {/* Header: back + stage label + close */}
-      <View style={styles.header}>
+      {/* Header: back + stage label + close (sits right below the status bar) */}
+      <View
+        style={[
+          styles.header,
+          { paddingTop: modalHeaderTop, paddingBottom: 10 },
+        ]}
+      >
         {backTargets[stage] && selectedVersion ? (
           <Pressable
             onPress={() => {
@@ -414,15 +573,27 @@ function VersePickerBody({
       {stage === 'version' ? (
         <>
           <View style={styles.searchBar}>
-            <TextInput
-              style={styles.searchInput}
-              placeholder="Search Bible versions…"
-              placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
-              value={versionQuery}
-              onChangeText={setVersionQuery}
-              autoCorrect={false}
-              autoCapitalize="none"
-            />
+            <View style={styles.searchInputRow}>
+              <TextInput
+                style={styles.searchInput}
+                placeholder="Search Bible versions…"
+                placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
+                value={versionQuery}
+                onChangeText={setVersionQuery}
+                autoCorrect={false}
+                autoCapitalize="none"
+              />
+              {versionQuery.length > 0 ? (
+                <Pressable
+                  style={styles.searchClearBtn}
+                  onPress={() => setVersionQuery('')}
+                  accessibilityRole="button"
+                  accessibilityLabel="Clear version search"
+                >
+                  <Text style={styles.searchClearText}>✕</Text>
+                </Pressable>
+              ) : null}
+            </View>
           </View>
           <View style={styles.versionSearchStatus}>
             <Text style={styles.versionListLabel}>On This Device</Text>
@@ -485,42 +656,64 @@ function VersePickerBody({
         </>
       ) : null}
 
-      {/* Step 2 — searchable 66-book list */}
+      {/* Step 2 — searchable list of the version's own books */}
       {stage === 'books' ? (
         <>
           <View style={styles.searchBar}>
-            <TextInput
-              style={styles.searchInput}
-              placeholder="Search book (John / யோவான்)…"
-              placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
-              value={bookQuery}
-              onChangeText={setBookQuery}
-              autoCorrect={false}
-            />
+            <View style={styles.searchInputRow}>
+              <TextInput
+                style={styles.searchInput}
+                placeholder="Search book…"
+                placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
+                value={bookQuery}
+                onChangeText={setBookQuery}
+                autoCorrect={false}
+              />
+              {bookQuery.length > 0 ? (
+                <Pressable
+                  style={styles.searchClearBtn}
+                  onPress={() => setBookQuery('')}
+                  accessibilityRole="button"
+                  accessibilityLabel="Clear book search"
+                >
+                  <Text style={styles.searchClearText}>✕</Text>
+                </Pressable>
+              ) : null}
+            </View>
           </View>
           <ScrollView contentContainerStyle={styles.listContent}>
-            {(['OT', 'NT'] as const).map((testament) => {
-              const books = getBooksByTestament(testament).filter((book) =>
-                filteredBooks.some((match) => match.id === book.id),
-              );
-              if (books.length === 0) return null;
+            {([
+              {
+                key: 'ot',
+                label: localizedBook(1).otLabel,
+                books: oldTestamentBooks,
+              },
+              {
+                key: 'nt',
+                label: localizedBook(40).ntLabel,
+                books: newTestamentBooks,
+              },
+            ] as const).map((section) => {
+              // FIX 2 — render each testament section ONLY when the picked
+              // version actually carries books in that canonical range: NT-only
+              // Bibles hide the Old Testament, OT-only Hebrew Bibles hide the
+              // New Testament.
+              if (section.books.length === 0) return null;
               return (
-                <View key={testament}>
-                  <Text style={styles.sectionLabel}>
-                    {testament === 'OT'
-                      ? 'Old Testament · பழைய ஏற்பாடு'
-                      : 'New Testament · புதிய ஏற்பாடு'}
-                  </Text>
-                  {books.map((book) => (
+                <View key={section.key}>
+                  <Text style={styles.sectionLabel}>{section.label}</Text>
+                  {section.books.map(({ book, manifest }) => (
                     <Pressable
                       key={book.id}
                       style={[styles.bookRow, selectedBook?.id === book.id ? styles.versionRowPicked : null]}
                       onPress={() => chooseBook(book)}
                       accessibilityRole="button"
-                      accessibilityLabel={`${book.englishName}, ${getBookChapterCount(selectedVersion?.id ?? 'tamil_bsi', book.id)} chapters`}
+                      accessibilityLabel={`${manifest.englishName || manifest.nativeName}, ${manifest.chapters} chapters`}
                     >
-                      <Text numberOfLines={1} style={styles.bookTamil}>{book.tamilName}</Text>
-                      <Text numberOfLines={1} style={styles.bookEnglish}>{book.englishName}</Text>
+                      <Text numberOfLines={1} style={styles.bookTamil}>{manifest.nativeName}</Text>
+                      <Text numberOfLines={1} style={styles.bookEnglish}>
+                        {manifest.englishName}
+                      </Text>
                     </Pressable>
                   ))}
                 </View>
@@ -530,21 +723,21 @@ function VersePickerBody({
         </>
       ) : null}
 
-      {/* Step 3 — chapter grid for the chosen book */}
+      {/* Step 3 — chapter grid for the chosen book (full-width 5 columns) */}
       {stage === 'chapters' && selectedBook ? (
         <ScrollView contentContainerStyle={styles.listContent}>
           <View style={styles.chapterGrid}>
             {Array.from({ length: selectedBookChapterCount }, (_, index) => index + 1).map(
               (chapter) => (
-                <Pressable
+                <ScalePressable
                   key={chapter}
-                  style={styles.chapterCell}
+                  style={[styles.chapterCell, { width: tileWidth, height: 50, borderRadius: 12 }]}
                   onPress={() => chooseChapter(chapter)}
                   accessibilityRole="button"
                   accessibilityLabel={`${selectedBook.englishName} chapter ${chapter}`}
                 >
                   <Text style={styles.chapterCellText}>{chapter}</Text>
-                </Pressable>
+                </ScalePressable>
               ),
             )}
           </View>
@@ -555,7 +748,7 @@ function VersePickerBody({
       {stage === 'verses' && selectedBook ? (
         <>
           <Text numberOfLines={1} style={styles.stepHint}>
-            {`${selectedVersion?.shortName ?? ''} · ${getBookById(selectedBook.id)?.tamilName ?? selectedBook.tamilName} ${selectedChapter}`}
+            {`${selectedVersion?.shortName ?? ''} · ${localizedBook(selectedBook.id).primaryName} ${selectedChapter}`}
           </Text>
           <ScrollView contentContainerStyle={styles.listContent}>
             {loadingVerses ? (
@@ -590,7 +783,7 @@ function VersePickerBody({
                     <View style={styles.previewHeader}>
                       <PlusVerseSvg size={16} color={theme.primary} />
                       <Text numberOfLines={1} style={styles.previewRef}>
-                        {`${selectedBook.englishName} ${selectedChapter}:${verseLabel}`}
+                        {`${localizedBook(selectedBook.id).primaryName} ${selectedChapter}:${verseLabel}`}
                       </Text>
                     </View>
                     <Text style={styles.previewText}>{previewText}</Text>
@@ -611,7 +804,7 @@ function VersePickerBody({
               </>
             )}
           </ScrollView>
-          <View style={styles.insertBar}>
+          <View style={[styles.insertBar, { paddingBottom: Math.max(insets.bottom, 16) }]}>
             <Pressable
               style={[styles.insertButton, selectedVerses.size === 0 ? styles.insertButtonDisabled : null]}
               onPress={insertVerse}
@@ -644,7 +837,6 @@ function makeStyles(theme: AppTheme) {
       alignItems: 'center',
       gap: 12,
       paddingHorizontal: 16,
-      paddingVertical: 10,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
       backgroundColor: theme.surface,
@@ -663,15 +855,32 @@ function makeStyles(theme: AppTheme) {
       paddingHorizontal: 14,
       paddingVertical: 8,
     },
-    searchInput: {
+    searchInputRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
       minHeight: 40,
       borderWidth: 1,
       borderColor: theme.isDark ? '#334155' : '#CBD5E1',
       backgroundColor: theme.isDark ? '#1E293B' : '#F1F5F9',
-      color: theme.isDark ? '#F8FAFC' : '#0F172A',
       borderRadius: 10,
-      paddingHorizontal: 12,
+      paddingHorizontal: 8,
+    },
+    searchInput: {
+      flex: 1,
+      minHeight: 40,
+      color: theme.isDark ? '#F8FAFC' : '#0F172A',
+      paddingHorizontal: 6,
       fontSize: 14,
+    },
+    searchClearBtn: {
+      padding: 6,
+      justifyContent: 'center',
+      alignItems: 'center',
+    },
+    searchClearText: {
+      color: theme.textMuted,
+      fontSize: 14,
+      fontWeight: '600',
     },
     listContent: {
       paddingHorizontal: 16,
@@ -738,13 +947,10 @@ function makeStyles(theme: AppTheme) {
     chapterGrid: {
       flexDirection: 'row',
       flexWrap: 'wrap',
-      gap: 8,
+      gap: 10,
       paddingTop: 8,
     },
     chapterCell: {
-      width: 56,
-      height: 44,
-      borderRadius: 10,
       borderWidth: 1,
       borderColor: theme.border,
       backgroundColor: theme.surface,

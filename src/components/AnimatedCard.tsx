@@ -8,7 +8,7 @@
  */
 
 import { useEffect, useState, type ReactNode } from 'react';
-import { Animated, Easing, type StyleProp, ViewStyle } from 'react-native';
+import { Animated, Easing, type StyleProp, type ViewStyle } from 'react-native';
 
 export interface AnimatedCardProps {
   children: ReactNode;

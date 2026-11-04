@@ -11,27 +11,30 @@
  *    backed by the merged catalog.
  *  - A summary card with the ProgressTrophySvg: total %, Old Testament %, New
  *    Testament % (each with its own bar), and days read this month.
- *  - A 66-book grid in two flat column cards per testament via FlatList
- *    `numColumns={2}`. Percentages are verse-weighted: fully-read chapters
- *    count as 1 and partially-read chapters count as their read verse
+ *  - A grid of the version's OWN books in two flat column cards per testament
+ *    via FlatList `numColumns={2}`. Percentages are verse-weighted: fully-read
+ *    chapters count as 1 and partially-read chapters count as their read verse
  *    fraction, so the Home reader's verse-level mark-read state advances this
  *    tab. Book names resolve through `getLocalizedBookName()` in the tracked
- *    version's own language.
+ *    version's own language, and all totals use that version's true chapter
+ *    counts (a 4-Gospel Bible totals 89 chapters, never 1,189).
  *  - Tapping a card opens a modal chapter grid (verse-aware: a chapter is
  *    read when every verse is read) toggled through `toggleChapterRead()`.
  */
 
-import { useCallback, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
   FlatList,
   Modal,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
   View,
+  useWindowDimensions,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from 'expo-router';
@@ -39,8 +42,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '@/constants/ThemeContext';
 import type { AppTheme } from '@/constants/colors';
 import {
-  BIBLE_BOOKS,
-  getBooksByTestament,
+  getBookById,
   getLocalizedBookName,
   type BibleBook,
   type BookLanguageVersionMeta,
@@ -49,7 +51,9 @@ import {
 import {
   getAllReadingProgress,
   getVersionProgressSummary,
+  rebuildReadChapterIndex,
   toggleChapterRead,
+  onProgressUpdated,
   type BookProgressSummary,
   type ReadingProgressRow,
 } from '@/db/database';
@@ -60,10 +64,11 @@ import {
   getActiveVersionId,
   getBookChapterVerseCounts,
   getInstalledVersions,
+  getVersionBooksManifest,
   getVersionBookNames,
-  isVersionDownloaded,
   normalizeVersionId,
   type BibleVersionMeta,
+  type VersionBookManifestEntry,
 } from '@/db/bibleLoader';
 import {
   getMergedCatalogVersions,
@@ -79,21 +84,6 @@ import { ProgressTrophySvg } from '@/components/SvgIcons';
 // ---------------------------------------------------------------------------
 
 const PROGRESS_VERSION_KEY = '@progress_selected_version';
-/** Set to '1' when the user explicitly picked a tracking version here. */
-const PROGRESS_VERSION_LOCK_KEY = '@progress_version_locked';
-
-const TOTAL_CHAPTERS = BIBLE_BOOKS.reduce((sum, book) => sum + book.chaptersCount, 0);
-
-const TESTAMENT_TOTALS: Record<Testament, number> = (['OT', 'NT'] as const).reduce(
-  (totals, testament) => {
-    totals[testament] = getBooksByTestament(testament).reduce(
-      (sum, book) => sum + book.chaptersCount,
-      0,
-    );
-    return totals;
-  },
-  { OT: 0, NT: 0 },
-);
 
 function pad2(value: number): string {
   return String(value).padStart(2, '0');
@@ -116,25 +106,133 @@ function partialChapterWeight(readVerses: number, totalVerses: number): number {
   return Math.min(readVerses / totalVerses, 1);
 }
 
-/** Verse-weighted progress of ONE book: fully-read chapters + partial fraction. */
+/** Verse-weighted progress of ONE book against its version's own chapter count. */
 function bookWeight(
-  book: BibleBook,
+  chapters: number,
   summary: BookProgressSummary | undefined,
 ): { fullChapters: number; weight: number } {
   if (!summary) return { fullChapters: 0, weight: 0 };
   let partialWeight = 0;
   for (const [chapterKey, readVerses] of Object.entries(summary.partialVerseCounts)) {
     const chapter = Number(chapterKey);
-    if (!(chapter >= 1 && chapter <= book.chaptersCount)) continue;
+    if (!(chapter >= 1 && chapter <= chapters)) continue;
     partialWeight += partialChapterWeight(readVerses, summary.partialTotalVerseCounts[chapter] ?? 0);
   }
   const fullChapters = summary.readChapters.length;
   return { fullChapters, weight: fullChapters + partialWeight };
 }
 
+/** FIX 4 — one progress grid row: canonical book + the version's manifest. */
+type ProgressBookRow = {
+  book: BibleBook;
+  manifest: VersionBookManifestEntry;
+};
+
 type DownloaderRow =
   | { kind: 'group'; key: string; label: string }
   | { kind: 'version'; key: string; version: DownloadableVersion };
+
+interface BookGridCardProps {
+  book: BibleBook;
+  styles: ReturnType<typeof makeStyles>;
+  cardWidth: number;
+  /** Localized primary book name (primitive prop keeps memo compares cheap). */
+  name: string;
+  /** The tracked version's TRUE chapter count for this book. */
+  chapters: number;
+  /** Live verse-weighted read summary for THIS book (stable reference). */
+  summary: BookProgressSummary | undefined;
+  onPress: (book: BibleBook) => void;
+}
+
+/**
+ * Memoized two-column grid card: only the pressed book or a real progress
+ * change re-renders it; the parent's 66-row grids never re-render as a block.
+ */
+const BookGridCard = memo(function BookGridCard({
+  book,
+  styles,
+  cardWidth,
+  name,
+  chapters,
+  summary,
+  onPress,
+}: BookGridCardProps) {
+  const { fullChapters, weight } = bookWeight(chapters, summary);
+  const percent = chapters > 0 ? (weight / chapters) * 100 : 0;
+  const complete = percent >= 100;
+  return (
+    <ScalePressable
+      style={[
+        styles.bookTile,
+        { width: cardWidth },
+        complete ? styles.bookTileComplete : null,
+      ]}
+      onPress={() => onPress(book)}
+      accessibilityRole="button"
+      accessibilityLabel={`${name}, ${fullChapters} of ${chapters} chapters read`}
+    >
+      <Text numberOfLines={2} style={styles.bookTileName}>
+        {name}
+      </Text>
+      <View style={styles.bookTileCountRow}>
+        <Text style={styles.bookTileCount}>
+          {`${fullChapters} / ${chapters} chapters`}
+        </Text>
+        <Text style={styles.bookTilePercent}>{`${Math.round(percent)}%`}</Text>
+      </View>
+      <View style={styles.tileBarTrack}>
+        <View style={[styles.tileBarFill, { width: `${Math.min(percent, 100)}%` }]} />
+      </View>
+    </ScalePressable>
+  );
+});
+
+interface DownloaderRowItemProps {
+  item: DownloaderRow;
+  styles: ReturnType<typeof makeStyles>;
+  /** Live download percent for `item.version` (undefined while idle). */
+  percent: number | undefined;
+  onDownload: (version: DownloadableVersion) => void;
+  /** Accent color for text inside the busy button (theme primitive). */
+  accent: string;
+}
+
+/** Memoized downloader row (group label or one catalog version). */
+const DownloaderRowItem = memo(function DownloaderRowItem({
+  item,
+  styles,
+  percent,
+  onDownload,
+  accent,
+}: DownloaderRowItemProps) {
+  if (item.kind === 'group') {
+    return <Text style={styles.downloaderGroupLabel}>{item.label}</Text>;
+  }
+  const version = item.version;
+  return (
+    <View style={styles.downloaderRow}>
+      <View style={styles.downloaderMeta}>
+        <Text style={styles.downloaderName}>{version.name}</Text>
+        <Text numberOfLines={1} style={styles.downloaderSub}>
+          {version.languageName} · {version.shortName}
+        </Text>
+      </View>
+      <ScalePressable
+        style={[styles.downloaderButton, percent !== undefined ? styles.downloaderButtonBusy : null]}
+        onPress={() => void onDownload(version)}
+        disabled={percent !== undefined}
+        accessibilityRole="button"
+        accessibilityLabel={`Download ${version.shortName}`}
+      >
+        {percent !== undefined ? <ActivityIndicator size="small" color={accent} /> : null}
+        <Text style={styles.downloaderButtonText}>
+          {percent !== undefined ? `${Math.round(percent)}%` : 'Download'}
+        </Text>
+      </ScalePressable>
+    </View>
+  );
+});
 
 // ---------------------------------------------------------------------------
 // Screen
@@ -142,8 +240,23 @@ type DownloaderRow =
 
 export default function ProgressScreen() {
   const { theme } = useAppTheme();
-  const styles = makeStyles(theme);
+  const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
+  const { width: screenWidth } = useWindowDimensions();
+
+  // FIX 1: dynamic 5-column chapter grid inside the chapter-toggling modal.
+  const gridPadding = 16;
+  const gridGap = 10;
+  const gridCols = 5;
+  const tileWidth = Math.floor(
+    (screenWidth - gridPadding * 2 - gridGap * (gridCols - 1)) / gridCols,
+  );
+  /** Modal headers sit just below the status bar with no dead black gap. */
+  const modalHeaderTop = Platform.OS === 'android' ? 8 : insets.top + 6;
+
+  // FIX 4: exact 2-column book-card width — two cards plus the 12 gap fill
+  // the full row between the 16 side insets with no leftover space.
+  const cardWidth = Math.floor((screenWidth - 32 - 12) / 2);
 
   /** The version the Progress tab is tracking right now. */
   const [progressVersionId, setProgressVersionId] = useState(TAMIL_BSI_ID);
@@ -154,6 +267,12 @@ export default function ProgressScreen() {
   const [readDates, setReadDates] = useState<ReadingProgressRow[]>([]);
   /** Native custom book names parsed from the version's own JSON. */
   const [customBookNames, setCustomBookNames] = useState<Record<number, string>>({});
+  /**
+   * FIX 4 — the tracked version's EXACT book manifest: only books it carries,
+   * each with its true chapter count. The grid and all percentages use this,
+   * so a 4-Gospel version shows 4 books and 89 chapters — never 66 fillers.
+   */
+  const [versionBooks, setVersionBooks] = useState<VersionBookManifestEntry[]>([]);
   /** Chapter-toggling modal. */
   const [openBook, setOpenBook] = useState<BibleBook | null>(null);
   const [openBookReadChapters, setOpenBookReadChapters] = useState<ReadonlySet<number>>(new Set());
@@ -193,11 +312,24 @@ export default function ProgressScreen() {
     return { OT: labels.otLabel, NT: labels.ntLabel };
   }, [namesMeta, customBookNames]);
 
+  /** FIX 4 — only the books this version actually carries, canonical order. */
+  const progressBookRows = useMemo<ProgressBookRow[]>(() => {
+    const rows: ProgressBookRow[] = [];
+    versionBooks.forEach((manifest) => {
+      const book = getBookById(manifest.bookId);
+      if (book) rows.push({ book, manifest });
+    });
+    return rows;
+  }, [versionBooks]);
+
   /** Load the per-book read state + native book names for one version. */
   const loadProgressData = useCallback((id: string) => {
     void getVersionProgressSummary(id).then(setProgressSummary).catch(() => setProgressSummary({}));
     setReadDates(getAllReadingProgress(id));
     void getVersionBookNames(id).then(setCustomBookNames).catch(() => undefined);
+    void getVersionBooksManifest(id).then(setVersionBooks).catch(() => setVersionBooks([]));
+    // Pre-index read chapters in memory so readCount is O(1) on every tap.
+    rebuildReadChapterIndex(id);
   }, []);
 
   const refreshInstalled = useCallback(async () => {
@@ -209,30 +341,21 @@ export default function ProgressScreen() {
   }, []);
 
   /**
-   * Focus reload: follow the Home reader's active version unless the user
-   * explicitly locked a tracking version here. A legacy stored non-BSI id is
-   * still honored (it can only come from an explicit old-build switch), but
-   * never used when the version is no longer on the device.
+   * Focus reload: synchronizes with the active Bible version selected on the
+   * Home screen or the explicitly selected progress version, and refreshes
+   * all canonical reading progress stats.
    */
   const reload = useCallback(() => {
     void (async () => {
-      const [activeId, storedRaw, lockRaw] = await Promise.all([
+      const [activeId, storedRaw] = await Promise.all([
         getActiveVersionId(),
         AsyncStorage.getItem(PROGRESS_VERSION_KEY).catch(() => null),
-        AsyncStorage.getItem(PROGRESS_VERSION_LOCK_KEY).catch(() => null),
       ]);
       void refreshInstalled();
 
       const active = normalizeVersionId(activeId);
       const storedId = storedRaw ? normalizeVersionId(storedRaw) : '';
-      // No explicit switch yet (and no legacy non-default id stored) tracks
-      // whatever the Home reader is on right now.
-      const followReader = lockRaw !== '1' && (storedId === '' || storedId === TAMIL_BSI_ID);
-      const storedAvailable =
-        storedId !== '' && storedId === TAMIL_BSI_ID
-          ? true
-          : storedId !== '' && (await isVersionDownloaded(storedId));
-      const id = followReader || !storedAvailable ? active : storedId;
+      const id = storedId || active || TAMIL_BSI_ID;
       setProgressVersionId(id);
       loadProgressData(id);
     })();
@@ -244,14 +367,21 @@ export default function ProgressScreen() {
     }, [reload]),
   );
 
-  /** Pick the version the Progress tab tracks (explicit lock). */
+  /** Cross-screen sync: when the Home reader writes progress, reload so
+   * percentages and counts refresh without a tab switch. */
+  useEffect(() => {
+    const unsubscribe = onProgressUpdated(() => {
+      void loadProgressData(progressVersionId);
+    });
+    return () => unsubscribe();
+  }, [progressVersionId, loadProgressData]);
+
+  /** Pick the version the Progress tab tracks. */
   const handleSelectProgressVersion = useCallback(
     (meta: BibleVersionMeta) => {
       const id = normalizeVersionId(meta.id);
       setProgressVersionId(id);
-      void AsyncStorage
-        .multiSet([[PROGRESS_VERSION_KEY, id], [PROGRESS_VERSION_LOCK_KEY, '1']])
-        .catch(() => undefined);
+      void AsyncStorage.setItem(PROGRESS_VERSION_KEY, id).catch(() => undefined);
       loadProgressData(id);
       setVersionPickerOpen(false);
     },
@@ -323,21 +453,44 @@ export default function ProgressScreen() {
     }
   }, [downloadProgress, loadProgressData, progressVersionId, refreshInstalled]);
 
-  /** Weighted app-wide counters for the summary card. */
+  /** Weighted counters for the summary card — strictly this version's books. */
   const summaryStats = useMemo(() => {
     let otWeight = 0;
     let ntWeight = 0;
-    for (const book of BIBLE_BOOKS) {
-      const { weight } = bookWeight(book, progressSummary[book.id]);
-      if (book.testament === 'OT') otWeight += weight;
-      else ntWeight += weight;
+    let otTotal = 0;
+    let ntTotal = 0;
+    for (const { manifest } of progressBookRows) {
+      const { weight } = bookWeight(manifest.chapters, progressSummary[manifest.bookId]);
+      if (manifest.testament === 'OT') {
+        otWeight += weight;
+        otTotal += manifest.chapters;
+      } else {
+        ntWeight += weight;
+        ntTotal += manifest.chapters;
+      }
     }
     const month = todayIsoDate().slice(0, 7); // 'YYYY-MM'
     const daysThisMonth = new Set(
       readDates.filter((row) => row.read_date.startsWith(month)).map((row) => row.read_date),
     ).size;
-    return { totalWeight: otWeight + ntWeight, otWeight, ntWeight, daysThisMonth };
-  }, [progressSummary, readDates]);
+    return {
+      totalWeight: otWeight + ntWeight,
+      totalChapters: otTotal + ntTotal,
+      otWeight,
+      otTotal,
+      ntWeight,
+      ntTotal,
+      daysThisMonth,
+    };
+  }, [progressBookRows, progressSummary, readDates]);
+
+  /** True chapter count of the book open in the chapter modal. */
+  const openBookChapterCount = useMemo(
+    () => (openBook
+      ? versionBooks.find((entry) => entry.bookId === openBook.id)?.chapters ?? 0
+      : 0),
+    [openBook, versionBooks],
+  );
 
   /** Open the chapter modal: verse-aware state + verse totals per chapter. */
   const openBookModal = useCallback((book: BibleBook) => {
@@ -350,63 +503,68 @@ export default function ProgressScreen() {
   }, [progressSummary, progressVersionId]);
 
   /**
-   * Toggle one chapter inside the modal through the shared verse-level state
-   * machine (`toggleChapterRead`), then refresh the whole-tab summary so the
-   * cards and the summary stay consistent.
+   * Toggle one chapter inside the modal optimistically: local state flips
+   * synchronously so the cell repaints instantly, then the SQLite write runs
+   * async in a try/catch (rolling back on failure) without a full
+   * loadProgressData() scan on every tap.
    */
   const toggleOpenBookChapter = useCallback((chapter: number) => {
     const book = openBook;
     if (!book) return;
+    const id = normalizeVersionId(progressVersionId);
+    const totalVerses = openBookVerseTotals[chapter - 1] ?? 0;
+
+    // Capture whether it was read inside the functional updater so we don't
+    // read `openBookReadChapters` directly here (keeps the dep list minimal).
+    let wasRead = false;
+    // Optimistic update — repaint immediately, before SQLite lands.
+    setOpenBookReadChapters((previous) => {
+      wasRead = previous.has(chapter);
+      const next = new Set(previous);
+      if (wasRead) next.delete(chapter);
+      else next.add(chapter);
+      return next;
+    });
+
     void (async () => {
-      const id = normalizeVersionId(progressVersionId);
-      const totalVerses = openBookVerseTotals[chapter - 1] ?? 0;
-      const becameRead = await toggleChapterRead(id, book.id, chapter, totalVerses);
-      setOpenBookReadChapters((previous) => {
-        const next = new Set(previous);
-        if (becameRead) next.add(chapter);
-        else next.delete(chapter);
-        return next;
-      });
-      void getVersionProgressSummary(id).then(setProgressSummary).catch(() => undefined);
+      try {
+        await toggleChapterRead(id, book.id, chapter, totalVerses);
+      } catch {
+        // Roll back the optimistic change if the write failed.
+        setOpenBookReadChapters((previous) => {
+          const next = new Set(previous);
+          if (wasRead) next.add(chapter);
+          else next.delete(chapter);
+          return next;
+        });
+      }
     })();
   }, [openBook, openBookVerseTotals, progressVersionId]);
 
-  /** One two-column book card (grid item). */
+  /** Grid rows feed the memoized `BookGridCard`; deps stay minimal. */
   const renderBookCard = useCallback(
-    ({ item }: { item: BibleBook }) => {
-      const { fullChapters, weight } = bookWeight(item, progressSummary[item.id]);
-      const percent = item.chaptersCount > 0 ? (weight / item.chaptersCount) * 100 : 0;
-      const names = localizedBook(item.id);
-      const complete = percent >= 100;
-      return (
-        <ScalePressable
-          style={[styles.bookTile, complete ? styles.bookTileComplete : null]}
-          onPress={() => openBookModal(item)}
-          accessibilityRole="button"
-          accessibilityLabel={`${names.secondaryName || names.primaryName}, ${fullChapters} of ${item.chaptersCount} chapters read`}
-        >
-          <Text numberOfLines={2} style={styles.bookTileName}>
-            {names.primaryName}
-          </Text>
-          <View style={styles.bookTileCountRow}>
-            <Text numberOfLines={1} style={styles.bookTileCount}>
-              {`${fullChapters} / ${item.chaptersCount} ch`}
-            </Text>
-            <Text style={styles.bookTilePercent}>{`${Math.round(percent)}%`}</Text>
-          </View>
-          <View style={styles.tileBarTrack}>
-            <View style={[styles.tileBarFill, { width: `${Math.min(percent, 100)}%` }]} />
-          </View>
-        </ScalePressable>
-      );
-    },
-    [localizedBook, openBookModal, progressSummary, styles],
+    ({ item }: { item: ProgressBookRow }) => (
+      <BookGridCard
+        book={item.book}
+        styles={styles}
+        cardWidth={cardWidth}
+        name={localizedBook(item.book.id).primaryName}
+        chapters={item.manifest.chapters}
+        summary={progressSummary[item.book.id]}
+        onPress={openBookModal}
+      />
+    ),
+    [cardWidth, localizedBook, openBookModal, progressSummary, styles],
   );
 
-  /** Two-column grid of one testament, laid out by FlatList for perf. */
+  /** Stable book-grid keys. */
+  const bookGridKey = useCallback((row: ProgressBookRow) => String(row.book.id), []);
+
+  /** Two-column grid of one testament; hidden when the version has none. */
   const renderBookGrid = useCallback(
     (testament: Testament) => {
-      const books = getBooksByTestament(testament);
+      const rows = progressBookRows.filter((row) => row.manifest.testament === testament);
+      if (rows.length === 0) return null;
       return (
         <View style={styles.testamentSection}>
           <Text style={styles.testamentTitle}>{testamentLabels[testament]}</Text>
@@ -414,18 +572,24 @@ export default function ProgressScreen() {
             numColumns={2}
             scrollEnabled={false}
             style={styles.gridList}
-            data={books}
-            keyExtractor={(book) => String(book.id)}
+            data={rows}
+            keyExtractor={bookGridKey}
             renderItem={renderBookCard}
-            columnWrapperStyle={styles.gridColumn}
-            initialNumToRender={books.length}
-            maxToRenderPerBatch={books.length}
+            columnWrapperStyle={{
+              justifyContent: 'space-between',
+              paddingHorizontal: 16,
+              marginBottom: 12,
+            }}
+            // Nested non-scrolling grid: render the whole testament up front.
+            initialNumToRender={rows.length}
+            maxToRenderPerBatch={rows.length}
             windowSize={2}
+            removeClippedSubviews={Platform.OS === 'android'}
           />
         </View>
       );
     },
-    [renderBookCard, styles.gridColumn, styles.gridList, styles.testamentSection, styles.testamentTitle, testamentLabels],
+    [bookGridKey, progressBookRows, renderBookCard, styles.gridList, styles.testamentSection, styles.testamentTitle, testamentLabels],
   );
 
   /** From the version picker: open the catalog downloader after closing. */
@@ -436,41 +600,25 @@ export default function ProgressScreen() {
 
   const openBookNames = openBook ? localizedBook(openBook.id) : null;
 
+  /** Downloader rows feed the memoized `DownloaderRowItem`. */
   const renderDownloaderRow = useCallback(
-    ({ item }: { item: DownloaderRow }) => {
-      if (item.kind === 'group') {
-        return <Text style={styles.downloaderGroupLabel}>{item.label}</Text>;
-      }
-      const version = item.version;
-      const percent = downloadProgress[version.id];
-      return (
-        <View style={styles.downloaderRow}>
-          <View style={styles.downloaderMeta}>
-            <Text numberOfLines={1} style={styles.downloaderName}>{version.name}</Text>
-            <Text numberOfLines={1} style={styles.downloaderSub}>
-              {version.languageName} · {version.shortName}
-            </Text>
-          </View>
-          <ScalePressable
-            style={[styles.downloaderButton, percent !== undefined ? styles.downloaderButtonBusy : null]}
-            onPress={() => void handleDownloadForProgress(version)}
-            disabled={percent !== undefined}
-            accessibilityRole="button"
-            accessibilityLabel={`Download ${version.shortName}`}
-          >
-            {percent !== undefined ? <ActivityIndicator size="small" color={theme.primaryForeground} /> : null}
-            <Text style={styles.downloaderButtonText}>
-              {percent !== undefined ? `${Math.round(percent)}%` : 'Download'}
-            </Text>
-          </ScalePressable>
-        </View>
-      );
-    },
+    ({ item }: { item: DownloaderRow }) => (
+      <DownloaderRowItem
+        item={item}
+        styles={styles}
+        percent={item.kind === 'version' ? downloadProgress[item.version.id] : undefined}
+        onDownload={handleDownloadForProgress}
+        accent={theme.primaryForeground}
+      />
+    ),
     [downloadProgress, handleDownloadForProgress, styles, theme.primaryForeground],
   );
 
+  /** Stable downloader keys. */
+  const downloaderRowKey = useCallback((item: DownloaderRow) => item.key, []);
+
   return (
-    <View style={[styles.screen, { backgroundColor: theme.background, paddingTop: insets.top }]}>
+    <View style={[styles.screen, { backgroundColor: theme.background }]}>
       <AppHeader
         title="Reading Progress"
         right={
@@ -480,13 +628,16 @@ export default function ProgressScreen() {
             accessibilityRole="button"
             accessibilityLabel={`Progress version ${progressMeta?.shortName ?? ''}. Change version`}
           >
-            <Text numberOfLines={1} style={styles.versionBadgeText}>
+            <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8} style={styles.versionBadgeText}>
               {progressMeta?.shortName || '—'} ▾
             </Text>
           </ScalePressable>
         }
       />
       <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+        {/* Padded band for the pills + summary card (the book grids manage
+            their own 16 side insets so cards cover the full row width). */}
+        <View style={styles.contentInner}>
         {/* Independent per-tab version row (explicit selection locks tracking) */}
         <Text style={styles.versionRowLabel}>Reading Progress Version</Text>
         <View style={styles.versionPickerRow}>
@@ -507,13 +658,11 @@ export default function ProgressScreen() {
                   accessibilityLabel={`Track reading progress with ${meta.shortName}`}
                 >
                   <Text
-                    numberOfLines={1}
                     style={[styles.versionPillLang, active ? styles.versionPillLangActive : null]}
                   >
                     {meta.language}
                   </Text>
                   <Text
-                    numberOfLines={1}
                     style={[styles.versionPillName, active ? styles.versionPillNameActive : null]}
                   >
                     {meta.shortName}
@@ -540,51 +689,68 @@ export default function ProgressScreen() {
             <ProgressTrophySvg size={28} color={theme.primary} />
             <Text style={styles.summaryTitle}>Bible Reading Progress</Text>
             <Text style={styles.summaryCount}>
-              {Math.round(summaryStats.totalWeight)}/{TOTAL_CHAPTERS} chapters
+              {Math.round(summaryStats.totalWeight)}/{summaryStats.totalChapters} chapters
             </Text>
           </View>
           <View>
             <Text style={styles.barCaption}>
-              Total Bible · {percentLabel(summaryStats.totalWeight, TOTAL_CHAPTERS)}
+              Total Bible · {percentLabel(summaryStats.totalWeight, summaryStats.totalChapters)}
             </Text>
             <View style={styles.totalBarTrack}>
               <View
                 style={[
                   styles.totalBarFill,
-                  { width: `${Math.min((summaryStats.totalWeight / TOTAL_CHAPTERS) * 100, 100)}%` },
+                  {
+                    width: `${Math.min(
+                      (summaryStats.totalWeight / Math.max(summaryStats.totalChapters, 1)) * 100,
+                      100,
+                    )}%`,
+                  },
                 ]}
               />
             </View>
           </View>
           <View>
             <Text style={styles.barCaption}>
-              Old Testament · {percentLabel(summaryStats.otWeight, TESTAMENT_TOTALS.OT)}
+              Old Testament · {percentLabel(summaryStats.otWeight, summaryStats.otTotal)}
             </Text>
             <View style={styles.totalBarTrack}>
               <View
                 style={[
                   styles.otBarFill,
-                  { width: `${Math.min((summaryStats.otWeight / TESTAMENT_TOTALS.OT) * 100, 100)}%` },
+                  {
+                    width: `${Math.min(
+                      (summaryStats.otWeight / Math.max(summaryStats.otTotal, 1)) * 100,
+                      100,
+                    )}%`,
+                  },
                 ]}
               />
             </View>
           </View>
           <View>
             <Text style={styles.barCaption}>
-              New Testament · {percentLabel(summaryStats.ntWeight, TESTAMENT_TOTALS.NT)}
+              New Testament · {percentLabel(summaryStats.ntWeight, summaryStats.ntTotal)}
             </Text>
             <View style={styles.totalBarTrack}>
               <View
                 style={[
                   styles.ntBarFill,
-                  { width: `${Math.min((summaryStats.ntWeight / TESTAMENT_TOTALS.NT) * 100, 100)}%` },
+                  {
+                    width: `${Math.min(
+                      (summaryStats.ntWeight / Math.max(summaryStats.ntTotal, 1)) * 100,
+                      100,
+                    )}%`,
+                  },
                 ]}
               />
             </View>
           </View>
           <View style={styles.statGrid}>
             <View style={styles.statBox}>
-              <Text style={styles.statValue}>{percentLabel(summaryStats.totalWeight, TOTAL_CHAPTERS)}</Text>
+              <Text style={styles.statValue}>
+                {percentLabel(summaryStats.totalWeight, summaryStats.totalChapters)}
+              </Text>
               <Text numberOfLines={2} style={styles.statLabel}>Total Bible</Text>
             </View>
             <View style={styles.statBox}>
@@ -592,21 +758,22 @@ export default function ProgressScreen() {
               <Text numberOfLines={2} style={styles.statLabel}>Days read this month</Text>
             </View>
             <View style={styles.statBox}>
-              <Text numberOfLines={1} style={styles.statValueVersion}>
+              <Text style={styles.statValueVersion}>
                 {progressMeta?.shortName ?? '—'}
               </Text>
-              <Text numberOfLines={2} style={styles.statLabel}>Progress version</Text>
+              <Text style={styles.statLabel}>Progress version</Text>
             </View>
             <View style={styles.statBox}>
-              <Text numberOfLines={1} style={styles.statValue}>
+              <Text style={styles.statValue}>
                 {progressMeta?.language || '—'}
               </Text>
-              <Text numberOfLines={2} style={styles.statLabel}>Book names in this language</Text>
+              <Text style={styles.statLabel}>Book names in this language</Text>
             </View>
           </View>
         </View>
+        </View>
 
-        {/* 66-book grid, grouped by testament (localized names) */}
+        {/* The tracked version's own books, grouped by testament */}
         {renderBookGrid('OT')}
         {renderBookGrid('NT')}
       </ScrollView>
@@ -615,7 +782,7 @@ export default function ProgressScreen() {
       <Modal visible={openBook !== null} animationType="slide" onRequestClose={() => setOpenBook(null)}>
         {openBook ? (
           <View style={[styles.modalScreen, { backgroundColor: theme.background }]}>
-            <View style={styles.modalHeader}>
+            <View style={[styles.modalHeader, { paddingTop: modalHeaderTop, paddingBottom: 10 }]}>
               <ScalePressable
                 onPress={() => setOpenBook(null)}
                 accessibilityRole="button"
@@ -625,10 +792,10 @@ export default function ProgressScreen() {
               </ScalePressable>
               <View style={styles.modalHeaderText}>
                 <Text numberOfLines={1} style={styles.modalTitle}>
-                  {openBookNames?.secondaryName || openBookNames?.primaryName || openBook.englishName}
+                  {openBookNames?.primaryName || openBook.englishName}
                 </Text>
                 <Text numberOfLines={1} style={styles.modalSubtitle}>
-                  {openBookReadChapters.size}/{openBook.chaptersCount} read · tap to toggle ·{' '}
+                  {openBookReadChapters.size}/{openBookChapterCount} read · tap to toggle ·{' '}
                   {progressMeta?.shortName ?? '—'}
                 </Text>
               </View>
@@ -636,7 +803,7 @@ export default function ProgressScreen() {
             </View>
             <ScrollView contentContainerStyle={styles.chapterWrap}>
               <View style={styles.chapterGrid}>
-                {Array.from({ length: openBook.chaptersCount }, (_, index) => index + 1).map(
+                {Array.from({ length: openBookChapterCount }, (_, index) => index + 1).map(
                   (chapter) => {
                     const isRead = openBookReadChapters.has(chapter);
                     const partiallyRead = (progressSummary[openBook.id]?.partialVerseCounts[chapter] ?? 0) > 0;
@@ -645,6 +812,7 @@ export default function ProgressScreen() {
                         key={chapter}
                         style={[
                           styles.chapterCell,
+                          { width: tileWidth, height: 50 },
                           isRead ? styles.chapterCellRead : null,
                           !isRead && partiallyRead ? styles.chapterCellPartial : null,
                         ]}
@@ -685,7 +853,7 @@ export default function ProgressScreen() {
           />
           <View style={styles.pickerCard}>
             <View style={styles.pickerHeader}>
-              <Text style={styles.pickerTitle}>Choose Progress Version</Text>
+              <Text numberOfLines={1} style={styles.pickerTitle}>Choose Progress Version</Text>
               <Pressable
                 onPress={() => setVersionPickerOpen(false)}
                 accessibilityRole="button"
@@ -707,7 +875,7 @@ export default function ProgressScreen() {
                     accessibilityLabel={`Track reading progress with ${meta.name}`}
                   >
                     <View style={styles.pickerLanguageBadge}>
-                      <Text numberOfLines={1} style={styles.pickerLanguageText}>
+                      <Text style={styles.pickerLanguageText}>
                         {meta.language || '—'}
                       </Text>
                     </View>
@@ -748,8 +916,8 @@ export default function ProgressScreen() {
         presentationStyle="fullScreen"
         onRequestClose={() => setDownloaderOpen(false)}
       >
-        <View style={[styles.downloaderScreen, { backgroundColor: theme.background, paddingTop: insets.top }]}>
-          <View style={styles.downloaderHeader}>
+        <View style={[styles.downloaderScreen, { backgroundColor: theme.background }]}>
+          <View style={[styles.downloaderHeader, { paddingTop: modalHeaderTop, paddingBottom: 10 }]}>
             <ScalePressable
               style={styles.downloaderClose}
               onPress={() => setDownloaderOpen(false)}
@@ -769,8 +937,12 @@ export default function ProgressScreen() {
               style={styles.downloaderList}
               contentContainerStyle={styles.downloaderListContent}
               data={downloaderRows}
-              keyExtractor={(item) => item.key}
+              keyExtractor={downloaderRowKey}
               renderItem={renderDownloaderRow}
+              initialNumToRender={15}
+              maxToRenderPerBatch={15}
+              windowSize={5}
+              removeClippedSubviews={Platform.OS === 'android'}
             />
           ) : null}
         </View>
@@ -787,7 +959,8 @@ function makeStyles(theme: AppTheme) {
   return StyleSheet.create({
     screen: { flex: 1 },
     versionBadge: {
-      maxWidth: 150,
+      flexShrink: 1,
+      maxWidth: 180,
       borderRadius: 999,
       borderWidth: 1,
       borderColor: theme.primary,
@@ -796,10 +969,14 @@ function makeStyles(theme: AppTheme) {
       minHeight: 38,
       justifyContent: 'center',
     },
-    versionBadgeText: { color: theme.primary, fontSize: 13, fontWeight: '700', lineHeight: 22 },
-    content: {
-      padding: 16,
+    versionBadgeText: { color: theme.primary, fontSize: 13, fontWeight: '700', lineHeight: 22 },    content: {
+      paddingTop: 16,
       paddingBottom: 40,
+      gap: 14,
+    },
+    // horizontal inset band for pills + summary; book grids inset themselves
+    contentInner: {
+      paddingHorizontal: 16,
       gap: 14,
     },
     versionRowLabel: {
@@ -824,7 +1001,6 @@ function makeStyles(theme: AppTheme) {
       paddingHorizontal: 12,
       paddingVertical: 8,
       minHeight: 56,
-      maxWidth: 200,
       flexShrink: 1,
       justifyContent: 'center',
     },
@@ -913,25 +1089,23 @@ function makeStyles(theme: AppTheme) {
     statValue: { color: theme.primary, fontSize: 20, fontWeight: '800' },
     statValueVersion: { color: theme.primary, fontSize: 16, fontWeight: '800' },
     statLabel: { color: theme.textMuted, fontSize: 12, fontWeight: '600' },
-    // 66-book grid — two flat columns per testament via FlatList numColumns=2
+    // Book grid — two exact-width cards per row via FlatList numColumns=2
     testamentSection: { gap: 8 },
     testamentTitle: {
       color: theme.textMuted,
       fontSize: 13,
       fontWeight: '700',
       lineHeight: 22,
-      paddingHorizontal: 2,
+      paddingHorizontal: 16,
     },
     gridList: { flexGrow: 0 },
-    gridColumn: { justifyContent: 'space-between', marginBottom: 10 },
     bookTile: {
-      width: '48.5%',
-      minHeight: 88,
+      minHeight: 96,
       borderRadius: 14,
       borderWidth: 1,
       borderColor: theme.border,
       backgroundColor: theme.surface,
-      padding: 12,
+      padding: 14,
       justifyContent: 'space-between',
       gap: 6,
     },
@@ -941,9 +1115,9 @@ function makeStyles(theme: AppTheme) {
     },
     bookTileName: {
       color: theme.text,
-      fontSize: 14,
+      fontSize: 15,
       fontWeight: '700',
-      lineHeight: 20,
+      lineHeight: 21,
     },
     bookTileCountRow: {
       flexDirection: 'row',
@@ -978,7 +1152,6 @@ function makeStyles(theme: AppTheme) {
       flexDirection: 'row',
       alignItems: 'center',
       paddingHorizontal: 16,
-      paddingVertical: 12,
       gap: 10,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
@@ -989,16 +1162,13 @@ function makeStyles(theme: AppTheme) {
     modalTitle: { color: theme.text, fontSize: 16, fontWeight: '700' },
     modalSubtitle: { color: theme.textMuted, fontSize: 12, fontWeight: '600' },
     modalHeaderSpacer: { width: 18 },
-    chapterWrap: { padding: 12, paddingBottom: 40 },
+    chapterWrap: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 40 },
     chapterGrid: {
       flexDirection: 'row',
       flexWrap: 'wrap',
-      gap: 8,
+      gap: 10,
     },
     chapterCell: {
-      width: '17%',
-      aspectRatio: 1,
-      borderRadius: 10,
       borderWidth: 1,
       borderColor: theme.border,
       backgroundColor: theme.surface,
@@ -1012,7 +1182,12 @@ function makeStyles(theme: AppTheme) {
     chapterCellPartial: {
       borderColor: theme.primary,
     },
-    chapterCellText: { color: theme.text, fontSize: 15, fontWeight: '700' },
+    chapterCellText: {
+      color: theme.text,
+      fontSize: 15,
+      fontWeight: '700',
+      includeFontPadding: false,
+    },
     chapterCellTextRead: { color: theme.primaryForeground },
     // Version picker modal
     pickerBackdrop: {
@@ -1046,8 +1221,14 @@ function makeStyles(theme: AppTheme) {
       paddingHorizontal: 4,
       paddingBottom: 8,
     },
-    pickerTitle: { color: theme.text, fontSize: 16, fontWeight: '700' },
-    pickerClose: { color: theme.textMuted, fontSize: 16, fontWeight: '700', padding: 4 },
+    pickerTitle: {
+      flex: 1,
+      flexShrink: 1,
+      color: theme.text,
+      fontSize: 16,
+      fontWeight: '700',
+    },
+    pickerClose: { color: theme.textMuted, fontSize: 16, fontWeight: '700', padding: 4, flexShrink: 0 },
     pickerList: { flexGrow: 0 },
     pickerListContent: { paddingBottom: 8 },
     pickerRow: {
@@ -1064,7 +1245,7 @@ function makeStyles(theme: AppTheme) {
     pickerRowActive: { borderColor: theme.primary },
     pickerLanguageBadge: {
       alignSelf: 'flex-start',
-      maxWidth: 108,
+      flexShrink: 1,
       borderRadius: 6,
       backgroundColor: theme.surface,
       borderWidth: StyleSheet.hairlineWidth,
@@ -1096,7 +1277,6 @@ function makeStyles(theme: AppTheme) {
       alignItems: 'center',
       gap: 10,
       paddingHorizontal: 16,
-      paddingVertical: 12,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
       backgroundColor: theme.surface,

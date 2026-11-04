@@ -168,6 +168,36 @@ export const DEFAULT_VERSIONS: DownloadableVersion[] = [
     source: 'helloao',
     helloaoTranslationId: 'kan_irv',
   },
+  {
+    id: 'spa_pdt',
+    name: 'Palabra de Dios para Todos',
+    shortName: 'PDT',
+    englishName: 'Spanish Holy Bible: PDT',
+    languageName: 'Spanish',
+    languageCode: 'spa',
+    source: 'helloao',
+    helloaoTranslationId: 'spa_pdt',
+  },
+  {
+    id: 'spa_rvr',
+    name: 'Reina Valera 1909',
+    shortName: 'RVR',
+    englishName: 'Reina Valera 1909',
+    languageName: 'Spanish',
+    languageCode: 'spa',
+    source: 'helloao',
+    helloaoTranslationId: 'spa_rvr',
+  },
+  {
+    id: 'heb_mas',
+    name: 'Masoretic Hebrew Text (תנ״ך)',
+    shortName: 'MAS',
+    englishName: 'Hebrew Masoretic Old Testament',
+    languageName: 'Hebrew',
+    languageCode: 'heb',
+    source: 'helloao',
+    helloaoTranslationId: 'heb_mas',
+  },
 ];
 
 /** Popular shortlist rendered before the (possibly huge) online catalog. */
@@ -191,6 +221,10 @@ const NATIVE_BY_LANGUAGE_CODE: Record<string, string> = {
   mar: 'मराठी',
   ory: 'ଓଡ଼ିଆ',
   urd: 'اردو',
+  spa: 'Español',
+  es: 'Español',
+  heb: 'עברית',
+  hbo: 'עברית',
 };
 
 /**
@@ -346,6 +380,8 @@ export const LANGUAGE_NATIVE_NAMES: Record<string, string> = {
   Marathi: 'मराठी',
   Odia: 'ଓଡ଼ିଆ',
   Urdu: 'اردو',
+  Spanish: 'Español',
+  Hebrew: 'עברית',
 };
 
 /**

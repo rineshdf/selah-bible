@@ -147,3 +147,10 @@ export function useAppTheme(): ThemeContextValue {
   }
   return context;
 }
+
+/**
+ * Access the active theme context safely without throwing if rendered outside <ThemeProvider>.
+ */
+export function useOptionalAppTheme(): ThemeContextValue | null {
+  return useContext(ThemeContext);
+}
