@@ -113,7 +113,7 @@ selah-bible/
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/rinesh-df/selah-bible.git
+   git clone https://github.com/rineshdf/selah-bible.git
    cd selah-bible
    ```
 
