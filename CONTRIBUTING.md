@@ -35,6 +35,21 @@ Please help us keep this project welcoming, encouraging, and respectful for ever
   npx expo start -c
   ```
 
+### 2b. Recommended Editor & AI Coding Assistants
+
+Contributors are free to use any editor, but the project is tuned for the following stack — the repository already ships `AGENTS.md`, `claude.md`, and `.claude/settings.json`, so AI agents pick up the project rules (path aliases, the SQLite/FileSystem API rules, and the 5-color highlight palette) automatically:
+
+| Tool | What it is | Why it helps here |
+|------|------------|-------------------|
+| **[VS Code](https://code.visualstudio.com/)** | Primary editor | Install the *Expo Tools*, *ESLint*, *Prettier*, and *React Native Tools* extensions; integrated inline diagnostics for the `tsc --noEmit` / `expo lint` gates. |
+| **[Claude Code](https://claude.com/claude-code)** (VS Code extension & terminal CLI) | Anthropic's agentic coding assistant | Reads `claude.md` / `AGENTS.md` from the repo root and follows the project blueprint (Expo Router screens in `src/app/`, synchronous `expo-sqlite`, `expo-file-system/legacy` imports). |
+| **[OpenCode](https://opencode.ai)** | Terminal AI coding agent (multi-provider) | Honors the same `AGENTS.md` rule file. Configure a provider such as **9router** to route models like GLM (Zhipu) and others — one config file, many models. |
+| **[GitHub CLI (`gh`)](https://cli.github.com/)** | GitHub from the terminal | Fork/PR workflows, `gh pr create`, and `gh release` checks. Authenticate with `gh auth login`. |
+| **Android Studio** | Emulator + SDK manager | Required only for local `assembleRelease` APK builds and running Gradle tasks alongside the CLI. |
+
+> **Note for AI-assisted commits:** conventions still apply — CI must stay green (`npx tsc --noEmit` and `npx expo lint` both return 0), commits keep semantic messages, and you remain responsible for reviewing every generated diff before opening a Pull Request.
+
+
 ### 3. Architecture & Coding Conventions
 - **Routing**: All screens and tabs live under `src/app/` using Expo Router.
 - **Path Aliases**: Always use `@/*` for internal imports (e.g., `import { db } from '@/db/database'`).

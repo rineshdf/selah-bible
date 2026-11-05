@@ -161,7 +161,7 @@ To build a standalone production APK on your machine:
 
 ## 🤝 Contributing
 
-Contributions, bug reports, and feature suggestions are warmly welcomed! Please read our [CONTRIBUTING.md](CONTRIBUTING.md) guide for details on our code style, TypeScript checks, and pull request workflow.
+Contributions, bug reports, and feature suggestions are warmly welcomed! Please read our [CONTRIBUTING.md](CONTRIBUTING.md) guide for details on our code style, TypeScript checks, and pull request workflow — including our recommended editor stack (**VS Code**) and AI coding assistants (**Claude Code**, **OpenCode** with a **9router** model provider) that already honor this repository's `AGENTS.md` project rules.
 
 ---
 
