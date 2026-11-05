@@ -24,20 +24,19 @@
 
 import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  ActivityIndicator,
-  Alert,
   FlatList,
   Modal,
   Platform,
   Pressable,
   ScrollView,
+  StatusBar,
   StyleSheet,
   Text,
   View,
   useWindowDimensions,
 } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useFocusEffect } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '@/constants/ThemeContext';
 import type { AppTheme } from '@/constants/colors';
@@ -51,6 +50,7 @@ import {
 import {
   getAllReadingProgress,
   getVersionProgressSummary,
+  notifyProgressUpdated,
   rebuildReadChapterIndex,
   toggleChapterRead,
   onProgressUpdated,
@@ -60,7 +60,6 @@ import {
 import {
   DEFAULT_TAMIL_BSI_META,
   TAMIL_BSI_ID,
-  downloadBibleVersion,
   getActiveVersionId,
   getBookChapterVerseCounts,
   getInstalledVersions,
@@ -70,11 +69,6 @@ import {
   type BibleVersionMeta,
   type VersionBookManifestEntry,
 } from '@/db/bibleLoader';
-import {
-  getMergedCatalogVersions,
-  groupVersionsByLanguage,
-  type DownloadableVersion,
-} from '@/constants/versionCatalog';
 import AppHeader from '@/components/AppHeader';
 import { ScalePressable } from '@/components/ScalePressable';
 import { ProgressTrophySvg } from '@/components/SvgIcons';
@@ -127,10 +121,6 @@ type ProgressBookRow = {
   book: BibleBook;
   manifest: VersionBookManifestEntry;
 };
-
-type DownloaderRow =
-  | { kind: 'group'; key: string; label: string }
-  | { kind: 'version'; key: string; version: DownloadableVersion };
 
 interface BookGridCardProps {
   book: BibleBook;
@@ -188,52 +178,6 @@ const BookGridCard = memo(function BookGridCard({
   );
 });
 
-interface DownloaderRowItemProps {
-  item: DownloaderRow;
-  styles: ReturnType<typeof makeStyles>;
-  /** Live download percent for `item.version` (undefined while idle). */
-  percent: number | undefined;
-  onDownload: (version: DownloadableVersion) => void;
-  /** Accent color for text inside the busy button (theme primitive). */
-  accent: string;
-}
-
-/** Memoized downloader row (group label or one catalog version). */
-const DownloaderRowItem = memo(function DownloaderRowItem({
-  item,
-  styles,
-  percent,
-  onDownload,
-  accent,
-}: DownloaderRowItemProps) {
-  if (item.kind === 'group') {
-    return <Text style={styles.downloaderGroupLabel}>{item.label}</Text>;
-  }
-  const version = item.version;
-  return (
-    <View style={styles.downloaderRow}>
-      <View style={styles.downloaderMeta}>
-        <Text style={styles.downloaderName}>{version.name}</Text>
-        <Text numberOfLines={1} style={styles.downloaderSub}>
-          {version.languageName} · {version.shortName}
-        </Text>
-      </View>
-      <ScalePressable
-        style={[styles.downloaderButton, percent !== undefined ? styles.downloaderButtonBusy : null]}
-        onPress={() => void onDownload(version)}
-        disabled={percent !== undefined}
-        accessibilityRole="button"
-        accessibilityLabel={`Download ${version.shortName}`}
-      >
-        {percent !== undefined ? <ActivityIndicator size="small" color={accent} /> : null}
-        <Text style={styles.downloaderButtonText}>
-          {percent !== undefined ? `${Math.round(percent)}%` : 'Download'}
-        </Text>
-      </ScalePressable>
-    </View>
-  );
-});
-
 // ---------------------------------------------------------------------------
 // Screen
 // ---------------------------------------------------------------------------
@@ -242,6 +186,7 @@ export default function ProgressScreen() {
   const { theme } = useAppTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const { width: screenWidth } = useWindowDimensions();
 
   // FIX 1: dynamic 5-column chapter grid inside the chapter-toggling modal.
@@ -251,8 +196,19 @@ export default function ProgressScreen() {
   const tileWidth = Math.floor(
     (screenWidth - gridPadding * 2 - gridGap * (gridCols - 1)) / gridCols,
   );
-  /** Modal headers sit just below the status bar with no dead black gap. */
-  const modalHeaderTop = Platform.OS === 'android' ? 8 : insets.top + 6;
+  /**
+   * Guaranteed top inset for every full-screen <Modal> header. Android
+   * edge-to-edge renders modal windows behind the status bar and camera
+   * cutout, so `insets.top` alone is not enough: take the platform status bar
+   * height too and enforce a 36px floor so the ✕ Close, book titles, and
+   * Mark All/Clear pills always sit safely below the clock, center cutout,
+   * and battery icon.
+   */
+  const topModalInset = Math.max(
+    insets.top,
+    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 36) : 0,
+    36,
+  );
 
   // FIX 4: exact 2-column book-card width — two cards plus the 12 gap fill
   // the full row between the 16 side insets with no leftover space.
@@ -271,8 +227,21 @@ export default function ProgressScreen() {
    * FIX 4 — the tracked version's EXACT book manifest: only books it carries,
    * each with its true chapter count. The grid and all percentages use this,
    * so a 4-Gospel version shows 4 books and 89 chapters — never 66 fillers.
+   *
+   * Tagged with its version id so switching the tracked version can never
+   * render the previous version's books/percentages for even one frame.
    */
-  const [versionBooks, setVersionBooks] = useState<VersionBookManifestEntry[]>([]);
+  const [versionBooksState, setVersionBooksState] = useState<{
+    versionId: string;
+    books: VersionBookManifestEntry[];
+  } | null>(null);
+  const versionBooks = useMemo(
+    () => (versionBooksState &&
+      versionBooksState.versionId === normalizeVersionId(progressVersionId)
+      ? versionBooksState.books
+      : []),
+    [progressVersionId, versionBooksState],
+  );
   /** Chapter-toggling modal. */
   const [openBook, setOpenBook] = useState<BibleBook | null>(null);
   const [openBookReadChapters, setOpenBookReadChapters] = useState<ReadonlySet<number>>(new Set());
@@ -280,10 +249,6 @@ export default function ProgressScreen() {
   const [openBookVerseTotals, setOpenBookVerseTotals] = useState<number[]>([]);
   /** Top-right version pill: clean installed-version picker modal. */
   const [versionPickerOpen, setVersionPickerOpen] = useState(false);
-  const [downloaderOpen, setDownloaderOpen] = useState(false);
-  const [downloaderRows, setDownloaderRows] = useState<DownloaderRow[]>([]);
-  const [downloaderLoading, setDownloaderLoading] = useState(false);
-  const [downloadProgress, setDownloadProgress] = useState<Record<string, number>>({});
 
   /** Metadata of the tracked version (bundled fallback for the BSI). */
   const progressMeta = useMemo(() => {
@@ -327,7 +292,9 @@ export default function ProgressScreen() {
     void getVersionProgressSummary(id).then(setProgressSummary).catch(() => setProgressSummary({}));
     setReadDates(getAllReadingProgress(id));
     void getVersionBookNames(id).then(setCustomBookNames).catch(() => undefined);
-    void getVersionBooksManifest(id).then(setVersionBooks).catch(() => setVersionBooks([]));
+    void getVersionBooksManifest(id)
+      .then((books) => setVersionBooksState({ versionId: normalizeVersionId(id), books }))
+      .catch(() => setVersionBooksState({ versionId: normalizeVersionId(id), books: [] }));
     // Pre-index read chapters in memory so readCount is O(1) on every tap.
     rebuildReadChapterIndex(id);
   }, []);
@@ -388,71 +355,6 @@ export default function ProgressScreen() {
     [loadProgressData],
   );
 
-  /** In-tab downloader: load the grouped merged catalog when it opens. */
-  const openDownloader = useCallback(() => {
-    setDownloaderOpen(true);
-    setDownloaderLoading(true);
-    void getMergedCatalogVersions()
-      .then((versions) => {
-        const installedIds = new Set(installedMetas.map((meta) => normalizeVersionId(meta.id)));
-        const available = versions.filter((version) => !installedIds.has(normalizeVersionId(version.id)));
-        const rows: DownloaderRow[] = [];
-        for (const group of groupVersionsByLanguage(available)) {
-          rows.push({ kind: 'group', key: `group:${group.language}`, label: group.label });
-          for (const version of group.versions) {
-            rows.push({ kind: 'version', key: `version:${version.id}`, version });
-          }
-        }
-        if (rows.length === 0) {
-          rows.push({ kind: 'group', key: 'group:none', label: 'Everything in the catalog is already on this device.' });
-        }
-        setDownloaderRows(rows);
-      })
-      .catch(() => {
-        setDownloaderRows([
-          { kind: 'group', key: 'group:error', label: 'Could not load the catalog. Check your connection.' },
-        ]);
-      })
-      .finally(() => setDownloaderLoading(false));
-  }, [installedMetas]);
-
-  const handleDownloadForProgress = useCallback(async (version: DownloadableVersion) => {
-    if (downloadProgress[version.id] !== undefined) return;
-    setDownloadProgress((previous) => ({ ...previous, [version.id]: 0 }));
-    try {
-      await downloadBibleVersion(version, (event) => {
-        setDownloadProgress((previous) => ({
-          ...previous,
-          [version.id]: Math.max(previous[version.id] ?? 0, event.percent),
-        }));
-      });
-      // The new version is installed: refresh the pill row + tracked reads.
-      await refreshInstalled();
-      setDownloaderRows((previous) => previous.filter(
-        (row) => !(row.kind === 'version' && row.version.id === version.id),
-      ));
-      setDownloadProgress((previous) => {
-        const next = { ...previous };
-        delete next[version.id];
-        return next;
-      });
-      // If the just-downloaded version is the one being tracked, reload.
-      if (normalizeVersionId(version.id) === progressVersionId) {
-        loadProgressData(progressVersionId);
-      }
-    } catch (error) {
-      Alert.alert(
-        'Download failed',
-        error instanceof Error ? error.message : `Could not download ${version.shortName}.`,
-      );
-      setDownloadProgress((previous) => {
-        const next = { ...previous };
-        delete next[version.id];
-        return next;
-      });
-    }
-  }, [downloadProgress, loadProgressData, progressVersionId, refreshInstalled]);
-
   /** Weighted counters for the summary card — strictly this version's books. */
   const summaryStats = useMemo(() => {
     let otWeight = 0;
@@ -491,6 +393,9 @@ export default function ProgressScreen() {
       : 0),
     [openBook, versionBooks],
   );
+
+  /** Every chapter of the open book is read → the pill shows `Clear`. */
+  const openBookAllRead = openBookChapterCount > 0 && openBookReadChapters.size >= openBookChapterCount;
 
   /** Open the chapter modal: verse-aware state + verse totals per chapter. */
   const openBookModal = useCallback((book: BibleBook) => {
@@ -592,30 +497,34 @@ export default function ProgressScreen() {
     [bookGridKey, progressBookRows, renderBookCard, styles.gridList, styles.testamentSection, styles.testamentTitle, testamentLabels],
   );
 
-  /** From the version picker: open the catalog downloader after closing. */
-  const openDownloaderFromPicker = useCallback(() => {
-    setVersionPickerOpen(false);
-    openDownloader();
-  }, [openDownloader]);
+  /** Bulk Mark All / Clear for the open book (optimistic, then SQLite). */
+  const toggleAllOpenBookChapters = useCallback(() => {
+    const book = openBook;
+    if (!book || openBookChapterCount <= 0) return;
+    const id = normalizeVersionId(progressVersionId);
+    const totals = openBookVerseTotals;
+    const allChapters = Array.from({ length: openBookChapterCount }, (_, index) => index + 1);
+    const unreadChapters = allChapters.filter((chapter) => !openBookReadChapters.has(chapter));
+    // Every chapter read → Clear (unmark the read ones). Otherwise → Mark All.
+    const clearing = unreadChapters.length === 0;
+    const targets = clearing ? [...openBookReadChapters] : unreadChapters;
+
+    // Optimistic repaint, then the writes land without scanning all books.
+    setOpenBookReadChapters(clearing ? new Set() : new Set(allChapters));
+    void (async () => {
+      for (const chapter of targets) {
+        try {
+          await toggleChapterRead(id, book.id, chapter, totals[chapter - 1] ?? 0);
+        } catch {
+          // Keep the optimistic state; the next modal open re-syncs from DB.
+        }
+      }
+      // Bulk change: announce so the summary card + grids refresh on tab focus.
+      notifyProgressUpdated();
+    })();
+  }, [openBook, openBookChapterCount, openBookReadChapters, openBookVerseTotals, progressVersionId]);
 
   const openBookNames = openBook ? localizedBook(openBook.id) : null;
-
-  /** Downloader rows feed the memoized `DownloaderRowItem`. */
-  const renderDownloaderRow = useCallback(
-    ({ item }: { item: DownloaderRow }) => (
-      <DownloaderRowItem
-        item={item}
-        styles={styles}
-        percent={item.kind === 'version' ? downloadProgress[item.version.id] : undefined}
-        onDownload={handleDownloadForProgress}
-        accent={theme.primaryForeground}
-      />
-    ),
-    [downloadProgress, handleDownloadForProgress, styles, theme.primaryForeground],
-  );
-
-  /** Stable downloader keys. */
-  const downloaderRowKey = useCallback((item: DownloaderRow) => item.key, []);
 
   return (
     <View style={[styles.screen, { backgroundColor: theme.background }]}>
@@ -673,7 +582,9 @@ export default function ProgressScreen() {
             <ScalePressable
               style={[styles.versionPill, styles.addVersionPill]}
               onPress={() => {
-                openDownloader();
+                // Route to the full Bible Library tab: no duplicate in-tab
+                // downloader anymore.
+                router.push('/(tabs)/bibles');
               }}
               accessibilityRole="button"
               accessibilityLabel="Download a version to track"
@@ -782,24 +693,43 @@ export default function ProgressScreen() {
       <Modal visible={openBook !== null} animationType="slide" onRequestClose={() => setOpenBook(null)}>
         {openBook ? (
           <View style={[styles.modalScreen, { backgroundColor: theme.background }]}>
-            <View style={[styles.modalHeader, { paddingTop: modalHeaderTop, paddingBottom: 10 }]}>
+            <View
+              style={[
+                styles.modalHeader,
+                { paddingTop: topModalInset + 10, paddingBottom: 12 },
+              ]}
+            >
+              {/* Left — round 40x40 ✕ Close button */}
               <ScalePressable
+                style={styles.modalIconButton}
                 onPress={() => setOpenBook(null)}
                 accessibilityRole="button"
                 accessibilityLabel="Close chapter tracker"
               >
                 <Text style={styles.modalClose}>✕</Text>
               </ScalePressable>
-              <View style={styles.modalHeaderText}>
+              {/* Center — book title + read-progress subtitle */}
+              <View style={styles.modalHeaderCenter}>
                 <Text numberOfLines={1} style={styles.modalTitle}>
                   {openBookNames?.primaryName || openBook.englishName}
                 </Text>
                 <Text numberOfLines={1} style={styles.modalSubtitle}>
-                  {openBookReadChapters.size}/{openBookChapterCount} read · tap to toggle ·{' '}
-                  {progressMeta?.shortName ?? '—'}
+                  {`${openBookReadChapters.size}/${openBookChapterCount} read • tap to toggle • ${progressMeta?.shortName ?? '—'}`}
                 </Text>
               </View>
-              <View style={styles.modalHeaderSpacer} />
+              {/* Right — Mark All / Clear toggle pill */}
+              <ScalePressable
+                style={styles.modalHeaderPill}
+                onPress={toggleAllOpenBookChapters}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  openBookAllRead ? 'Clear all read chapters' : 'Mark all chapters as read'
+                }
+              >
+                <Text numberOfLines={1} style={styles.modalHeaderPillText}>
+                  {openBookAllRead ? 'Clear' : 'Mark All'}
+                </Text>
+              </ScalePressable>
             </View>
             <ScrollView contentContainerStyle={styles.chapterWrap}>
               <View style={styles.chapterGrid}>
@@ -812,7 +742,7 @@ export default function ProgressScreen() {
                         key={chapter}
                         style={[
                           styles.chapterCell,
-                          { width: tileWidth, height: 50 },
+                          { width: tileWidth, height: 50, borderRadius: 14 },
                           isRead ? styles.chapterCellRead : null,
                           !isRead && partiallyRead ? styles.chapterCellPartial : null,
                         ]}
@@ -846,7 +776,7 @@ export default function ProgressScreen() {
         transparent
         onRequestClose={() => setVersionPickerOpen(false)}
       >
-        <View style={styles.pickerBackdrop}>
+        <View style={[styles.pickerBackdrop, { paddingTop: Math.max(22, topModalInset) }]}>
           <Pressable
             style={styles.pickerBackdropTouch}
             onPress={() => setVersionPickerOpen(false)}
@@ -899,52 +829,18 @@ export default function ProgressScreen() {
             </ScrollView>
             <ScalePressable
               style={styles.pickerDownloadButton}
-              onPress={openDownloaderFromPicker}
+              onPress={() => {
+                // Close any open modal and route straight to the full Bible
+                // Library tab (the standalone in-tab downloader is gone).
+                setVersionPickerOpen(false);
+                router.push('/(tabs)/bibles');
+              }}
               accessibilityRole="button"
               accessibilityLabel="Download more Bible versions"
             >
               <Text style={styles.pickerDownloadText}>+ Download More Versions</Text>
             </ScalePressable>
           </View>
-        </View>
-      </Modal>
-
-      {/* In-tab downloader modal */}
-      <Modal
-        visible={downloaderOpen}
-        animationType="slide"
-        presentationStyle="fullScreen"
-        onRequestClose={() => setDownloaderOpen(false)}
-      >
-        <View style={[styles.downloaderScreen, { backgroundColor: theme.background }]}>
-          <View style={[styles.downloaderHeader, { paddingTop: modalHeaderTop, paddingBottom: 10 }]}>
-            <ScalePressable
-              style={styles.downloaderClose}
-              onPress={() => setDownloaderOpen(false)}
-              accessibilityRole="button"
-              accessibilityLabel="Close version downloader"
-            >
-              <Text style={styles.downloaderCloseText}>Close ✕</Text>
-            </ScalePressable>
-            <Text numberOfLines={1} style={styles.downloaderTitle}>Download Version</Text>
-            <View style={styles.downloaderHeaderSpacer} />
-          </View>
-          {downloaderLoading ? (
-            <ActivityIndicator style={styles.downloaderSpinner} size="large" color={theme.primary} />
-          ) : null}
-          {!downloaderLoading ? (
-            <FlatList
-              style={styles.downloaderList}
-              contentContainerStyle={styles.downloaderListContent}
-              data={downloaderRows}
-              keyExtractor={downloaderRowKey}
-              renderItem={renderDownloaderRow}
-              initialNumToRender={15}
-              maxToRenderPerBatch={15}
-              windowSize={5}
-              removeClippedSubviews={Platform.OS === 'android'}
-            />
-          ) : null}
         </View>
       </Modal>
     </View>
@@ -1146,32 +1042,76 @@ function makeStyles(theme: AppTheme) {
       overflow: 'hidden',
     },
     tileBarFill: { height: '100%', borderRadius: 3, backgroundColor: theme.primary },
-    // Chapter modal
+    // Chapter modal — unified 3-column non-overlapping modal header
     modalScreen: { flex: 1 },
     modalHeader: {
       flexDirection: 'row',
       alignItems: 'center',
+      justifyContent: 'space-between',
       paddingHorizontal: 16,
       gap: 10,
-      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomWidth: 1,
       borderBottomColor: theme.border,
       backgroundColor: theme.surface,
     },
-    modalClose: { color: theme.text, fontSize: 18, fontWeight: '700' },
-    modalHeaderText: { flex: 1, gap: 1 },
-    modalTitle: { color: theme.text, fontSize: 16, fontWeight: '700' },
-    modalSubtitle: { color: theme.textMuted, fontSize: 12, fontWeight: '600' },
-    modalHeaderSpacer: { width: 18 },
-    chapterWrap: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 40 },
+    modalIconButton: {
+      width: 40,
+      height: 40,
+      borderRadius: 20,
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    modalClose: { color: theme.text, fontSize: 17, fontWeight: '700', lineHeight: 20 },
+    modalHeaderCenter: {
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingHorizontal: 6,
+    },
+    modalTitle: {
+      color: theme.text,
+      fontSize: 17,
+      fontWeight: '800',
+      textAlign: 'center',
+    },
+    modalSubtitle: {
+      color: theme.textMuted,
+      fontSize: 12,
+      fontWeight: '600',
+      textAlign: 'center',
+      marginTop: 2,
+    },
+    modalHeaderPill: {
+      minWidth: 64,
+      height: 36,
+      paddingHorizontal: 12,
+      borderRadius: 18,
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    modalHeaderPillText: {
+      color: theme.primary,
+      fontSize: 13,
+      fontWeight: '800',
+    },
+    chapterWrap: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 32 },
     chapterGrid: {
       flexDirection: 'row',
       flexWrap: 'wrap',
       gap: 10,
     },
     chapterCell: {
-      borderWidth: 1,
-      borderColor: theme.border,
-      backgroundColor: theme.surface,
+      borderWidth: 1.5,
+      borderColor: theme.isDark ? '#283548' : '#E2E8F0',
+      backgroundColor: theme.isDark ? '#172033' : '#F1F5F9',
       alignItems: 'center',
       justifyContent: 'center',
     },
@@ -1184,11 +1124,12 @@ function makeStyles(theme: AppTheme) {
     },
     chapterCellText: {
       color: theme.text,
-      fontSize: 15,
-      fontWeight: '700',
+      fontSize: 16,
+      fontWeight: '600',
       includeFontPadding: false,
+      fontVariant: ['tabular-nums'],
     },
-    chapterCellTextRead: { color: theme.primaryForeground },
+    chapterCellTextRead: { color: '#FFFFFF', fontWeight: '800' },
     // Version picker modal
     pickerBackdrop: {
       flex: 1,
@@ -1270,79 +1211,5 @@ function makeStyles(theme: AppTheme) {
       paddingHorizontal: 12,
     },
     pickerDownloadText: { color: theme.primary, fontSize: 14, fontWeight: '700' },
-    // Downloader modal
-    downloaderScreen: { flex: 1 },
-    downloaderHeader: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: 10,
-      paddingHorizontal: 16,
-      borderBottomWidth: StyleSheet.hairlineWidth,
-      borderBottomColor: theme.border,
-      backgroundColor: theme.surface,
-    },
-    downloaderClose: {
-      borderRadius: 999,
-      borderWidth: 1,
-      borderColor: theme.primary,
-      paddingHorizontal: 12,
-      paddingVertical: 7,
-      minHeight: 38,
-      justifyContent: 'center',
-    },
-    downloaderCloseText: {
-      color: theme.primary,
-      fontSize: 14,
-      fontWeight: '700',
-      lineHeight: 22,
-    },
-    downloaderTitle: {
-      color: theme.text,
-      fontSize: 17,
-      fontWeight: '700',
-      flex: 1,
-      textAlign: 'center',
-    },
-    downloaderHeaderSpacer: { width: 74 },
-    downloaderSpinner: { marginTop: 32 },
-    downloaderList: { flex: 1 },
-    downloaderListContent: {
-      paddingHorizontal: 16,
-      paddingTop: 8,
-      paddingBottom: 32,
-      gap: 10,
-    },
-    downloaderGroupLabel: {
-      color: theme.primary,
-      fontSize: 13,
-      fontWeight: '800',
-      lineHeight: 22,
-      marginTop: 8,
-    },
-    downloaderRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: 10,
-      borderRadius: 12,
-      borderWidth: 1,
-      borderColor: theme.border,
-      backgroundColor: theme.surface,
-      padding: 12,
-    },
-    downloaderMeta: { flex: 1, gap: 2 },
-    downloaderName: { color: theme.text, fontSize: 14, fontWeight: '700' },
-    downloaderSub: { color: theme.textMuted, fontSize: 12 },
-    downloaderButton: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      gap: 6,
-      borderRadius: 10,
-      backgroundColor: theme.primary,
-      paddingHorizontal: 12,
-      paddingVertical: 8,
-      minHeight: 38,
-    },
-    downloaderButtonBusy: { opacity: 0.75 },
-    downloaderButtonText: { color: theme.primaryForeground, fontSize: 13, fontWeight: '700' },
   });
 }

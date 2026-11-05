@@ -23,6 +23,7 @@ import {
   Pressable,
   ScrollView,
   SectionList,
+  StatusBar,
   StyleSheet,
   Text,
   View,
@@ -321,8 +322,18 @@ export default function HighlightsScreen() {
   const { theme } = useAppTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
-  /** Reader modal header sits just below the status bar — no dead black gap. */
-  const modalHeaderTop = Platform.OS === 'android' ? 8 : insets.top + 6;
+  /**
+   * Guaranteed top inset for every full-screen <Modal> header. Android
+   * edge-to-edge renders modal windows behind the status bar and camera
+   * cutout, so `insets.top` alone is not enough: take the platform status bar
+   * height too and enforce a 36px floor so `Close ✕` and the chapter title
+   * always sit safely below the clock, center cutout, and battery icon.
+   */
+  const topModalInset = Math.max(
+    insets.top,
+    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 36) : 0,
+    36,
+  );
 
   const [highlights, setHighlights] = useState<HighlightRow[]>([]);
   const [installedMetas, setInstalledMetas] = useState<BibleVersionMeta[]>([]);
@@ -801,7 +812,7 @@ export default function HighlightsScreen() {
           <View
             style={[
               styles.readerHeader,
-              { paddingTop: modalHeaderTop, paddingBottom: 10 },
+              { paddingTop: topModalInset + 10, paddingBottom: 12 },
             ]}
           >
             <ScalePressable

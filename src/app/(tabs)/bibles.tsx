@@ -19,12 +19,14 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  StatusBar,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from 'react-native';
 import { useFocusEffect } from 'expo-router';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAppTheme } from '@/constants/ThemeContext';
 import type { AppTheme } from '@/constants/colors';
 import {
@@ -289,6 +291,18 @@ const LibraryRow = memo(function LibraryRow({
 export default function BiblesScreen() {
   const { theme } = useAppTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
+  const insets = useSafeAreaInsets();
+  /**
+   * Guaranteed top inset for the Backup & Restore <Modal>. Android
+   * edge-to-edge can draw the floating card under the status bar and camera
+   * cutout, so the backdrop never lets it rise above the platform status bar
+   * height + a 36px floor.
+   */
+  const topModalInset = Math.max(
+    insets.top,
+    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 36) : 0,
+    36,
+  );
 
   const [backupOpen, setBackupOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -767,7 +781,7 @@ export default function BiblesScreen() {
         renderItem={renderItem}
       />
       <Modal visible={backupOpen} transparent animationType="fade" onRequestClose={() => setBackupOpen(false)}>
-        <View style={styles.modalBackdrop}>
+        <View style={[styles.modalBackdrop, { paddingTop: Math.max(22, topModalInset) }]}>
           <View style={styles.backupModal}>
             <View style={styles.modalHeading}>
               <BackupCloudSvg size={24} color={theme.primary} />

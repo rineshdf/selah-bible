@@ -31,6 +31,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  StatusBar,
   StyleSheet,
   Text,
   TextInput,
@@ -77,6 +78,7 @@ import {
   deleteHighlight,
   getChapterReadState,
   getHighlightsForPassage,
+  getVersionProgressSummary,
   markVersesRead,
   toggleChapterRead,
   unmarkVersesRead,
@@ -150,8 +152,19 @@ export default function BibleReaderScreen() {
   const rowGap = 8;
   const centerPillWidth =
     screenWidth - rowPadding * 2 - sideBtnWidth * 2 - rowGap * 2;
-  /** Modal headers sit just below the status bar with no dead black gap. */
-  const modalHeaderTop = Platform.OS === 'android' ? 8 : insets.top + 6;
+  /**
+   * Guaranteed top inset for every full-screen <Modal> header. Android
+   * edge-to-edge renders modal windows behind the status bar and camera
+   * cutout, so `insets.top` alone is not enough: take the platform status bar
+   * height too and enforce a 36px floor so the ✕ Close, book titles, and
+   * `< Back` buttons always sit safely below the clock, center cutout, and
+   * battery icon.
+   */
+  const topModalInset = Math.max(
+    insets.top,
+    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 36) : 0,
+    36,
+  );
 
   // -----------------------------------------------------------------------
   // Native first-launch setup: `bibles/TAMIL_BSI.json` is materialized from
@@ -253,6 +266,12 @@ export default function BibleReaderScreen() {
   );
   /** Chapter count of the book open in the picker, from the manifest. */
   const [pickerChapterCount, setPickerChapterCount] = useState(0);
+  /**
+   * Fully-read chapter count per canonical book id (verse-aware, canonical).
+   * Loads lazily whenever a book opens in the picker so the unified modal
+   * header can show `{readCount}/{totalChapters} read` with zero extra scans.
+   */
+  const [pickerReadCounts, setPickerReadCounts] = useState<Record<number, number>>({});
 
   const currentBook = getBookById(bookId) ?? BIBLE_BOOKS[0];
 
@@ -635,6 +654,22 @@ export default function BibleReaderScreen() {
     return items;
   }, [versionManifest]);
 
+  /**
+   * One canonical SQLite scan per opened book keeps the picker header's
+   * `{readCount}/{totalChapters} read` line live (verse-aware, any version).
+   */
+  const loadPickerReadCount = useCallback((id: number) => {
+    const normalizedId = normalizeVersionId(versionId);
+    void getVersionProgressSummary(normalizedId)
+      .then((summary) => {
+        setPickerReadCounts((previous) => ({
+          ...previous,
+          [id]: summary[id]?.readChapters.length ?? 0,
+        }));
+      })
+      .catch(() => undefined);
+  }, [versionId]);
+
   const openPicker = useCallback(() => {
     setPickerBook(currentBook);
     const entry = versionManifest?.find((item) => item.bookId === currentBook.id);
@@ -646,7 +681,8 @@ export default function BibleReaderScreen() {
     setPickerStage(chapterCount > 0 ? 'chapters' : 'books');
     setBookSearchQuery('');
     setPickerOpen(true);
-  }, [currentBook, versionManifest]);
+    loadPickerReadCount(currentBook.id);
+  }, [currentBook, loadPickerReadCount, versionManifest]);
 
   const filteredBooks = useMemo(() => {
     const q = bookSearchQuery.trim().toLowerCase();
@@ -1054,36 +1090,47 @@ export default function BibleReaderScreen() {
           <View
             style={[
               styles.pickerHeader,
-              { paddingTop: modalHeaderTop, paddingBottom: 10 },
+              {
+                paddingTop: topModalInset + 10,
+                paddingBottom: 12,
+                paddingHorizontal: 16,
+              },
             ]}
           >
+            {/* Left — round 40x40 ✕ Close button */}
             <ScalePressable
+              style={styles.pickerIconButton}
               onPress={() => setPickerOpen(false)}
               accessibilityRole="button"
               accessibilityLabel="Close book selector"
             >
               <Text style={styles.pickerClose}>✕</Text>
             </ScalePressable>
-            <Text numberOfLines={1} style={styles.pickerTitle}>
-              {pickerStage === 'books'
-                ? 'Select a Book'
-                : (() => {
-                    const names = localizedBook(pickerBook?.id ?? bookId);
-                    return `${names.primaryName} ${
-                      names.secondaryName ? `(${names.secondaryName})` : ''
-                    }`;
-                  })()}
-            </Text>
+            {/* Center — book title + read-progress subtitle */}
+            <View style={styles.pickerHeaderCenter}>
+              <Text numberOfLines={1} style={styles.pickerTitle}>
+                {pickerStage === 'books'
+                  ? 'Select a Book'
+                  : localizedBook(pickerBook?.id ?? bookId).primaryName}
+              </Text>
+              <Text numberOfLines={1} style={styles.pickerHeaderSubtitle}>
+                {pickerStage === 'books'
+                  ? `${pickerBooks.length} books • ${activeShortName}`
+                  : `${pickerReadCounts[pickerBook?.id ?? bookId] ?? 0}/${pickerChapterCount} read • tap to toggle • ${activeShortName}`}
+              </Text>
+            </View>
+            {/* Right — `< Back` pill (chapter grid stage only) */}
             {pickerStage === 'chapters' && pickerBook ? (
               <ScalePressable
+                style={styles.pickerHeaderPill}
                 onPress={() => setPickerStage('books')}
                 accessibilityRole="button"
                 accessibilityLabel="Back to book list"
               >
-                <Text style={styles.pickerBack}>{'‹ Back'}</Text>
+                <Text style={styles.pickerBack}>{'< Back'}</Text>
               </ScalePressable>
             ) : (
-              <View style={styles.pickerHeaderSpacer} />
+              <View style={styles.pickerHeaderPillSpacer} />
             )}
           </View>
 
@@ -1121,6 +1168,7 @@ export default function BibleReaderScreen() {
                           setPickerBook(book);
                           setPickerChapterCount(manifest.chapters);
                           setPickerStage('chapters');
+                          loadPickerReadCount(book.id);
                         }}
                         accessibilityRole="button"
                         accessibilityLabel={`${manifest.englishName || manifest.nativeName}, ${manifest.chapters} chapters`}
@@ -1169,6 +1217,7 @@ export default function BibleReaderScreen() {
                                 setPickerBook(book);
                                 setPickerChapterCount(manifest.chapters);
                                 setPickerStage('chapters');
+                                loadPickerReadCount(book.id);
                               }}
                               accessibilityRole="button"
                               accessibilityLabel={`${manifest.englishName || manifest.nativeName}, ${manifest.chapters} chapters`}
@@ -1212,7 +1261,7 @@ export default function BibleReaderScreen() {
                         key={chapterNumber}
                         style={[
                           styles.chapterCell,
-                          { width: tileWidth, height: 50, borderRadius: 12 },
+                          { width: tileWidth, height: 50, borderRadius: 14 },
                           isCurrent ? styles.chapterCellActive : null,
                         ]}
                         onPress={() => selectChapter(pickerBook.id, chapterNumber)}
@@ -1234,7 +1283,7 @@ export default function BibleReaderScreen() {
 
       {/* Quick version switcher (top-left pill): every version on this device */}
       <Modal visible={switcherOpen} transparent animationType="fade" onRequestClose={() => setSwitcherOpen(false)}>
-        <View style={[styles.switcherOverlay, { paddingTop: insets.top + 6 }]}>
+        <View style={[styles.switcherOverlay, { paddingTop: topModalInset }]}>
           <Pressable style={styles.switcherTouch} onPress={() => setSwitcherOpen(false)} />
           <View style={styles.switcherCard}>
             <View style={styles.switcherHeader}>
@@ -1242,7 +1291,7 @@ export default function BibleReaderScreen() {
               <Pressable
                 onPress={() => {
                   setSwitcherOpen(false);
-                  router.navigate('/bibles');
+                  router.push('/(tabs)/bibles');
                 }}
                 accessibilityRole="button"
                 accessibilityLabel="Open full version manager"
@@ -1285,7 +1334,7 @@ export default function BibleReaderScreen() {
               style={styles.switcherDownloadRow}
               onPress={() => {
                 setSwitcherOpen(false);
-                router.navigate('/bibles');
+                router.push('/(tabs)/bibles');
               }}
               accessibilityRole="button"
               accessibilityLabel="Download more Bible versions"
@@ -1800,16 +1849,61 @@ function makeStyles(theme: AppTheme) {
     },
     highlightBarClose: { color: theme.textMuted, fontSize: 15, fontWeight: '700' },
     pickerScreen: { flex: 1 },
+    // Unified 3-column non-overlapping modal header (✕ · title · `< Back`)
     pickerHeader: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 12,
-      paddingHorizontal: 16,
+      justifyContent: 'space-between',
+      gap: 10,
+      backgroundColor: theme.surface,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.border,
     },
-    pickerClose: { color: theme.text, fontSize: 18, fontWeight: '600' },
-    pickerTitle: { flex: 1, color: theme.text, fontSize: 17, fontWeight: '700', textAlign: 'center' },
+    pickerIconButton: {
+      width: 40,
+      height: 40,
+      borderRadius: 20,
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    pickerHeaderCenter: {
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingHorizontal: 6,
+    },
+    pickerHeaderSubtitle: {
+      color: theme.textMuted,
+      fontSize: 12,
+      fontWeight: '600',
+      textAlign: 'center',
+      marginTop: 2,
+    },
+    pickerHeaderPill: {
+      minWidth: 64,
+      height: 36,
+      paddingHorizontal: 12,
+      borderRadius: 18,
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    pickerHeaderPillSpacer: { minWidth: 64, height: 36, flexShrink: 0 },
+    pickerClose: { color: theme.text, fontSize: 17, fontWeight: '700', lineHeight: 20 },
+    pickerTitle: {
+      color: theme.text,
+      fontSize: 17,
+      fontWeight: '800',
+      textAlign: 'center',
+    },
     pickerBack: { color: theme.primary, fontSize: 14, fontWeight: '600' },
-    pickerHeaderSpacer: { width: 44 },
     pickerBookList: { paddingHorizontal: 16, paddingBottom: 32 },
     pickerSectionLabel: {
       color: theme.textMuted,
@@ -1835,22 +1929,28 @@ function makeStyles(theme: AppTheme) {
       textAlign: 'right',
     },
     pickerBookTextActive: { color: theme.primary, fontWeight: '700' },
-    pickerChapterWrap: { paddingHorizontal: 16, paddingTop: 12, paddingBottom: 40 },
+    pickerChapterWrap: { paddingHorizontal: 16, paddingTop: 16, paddingBottom: 32 },
+    // Rounded squircle 5-column chapter tiles (unified with Progress tab)
     chapterGrid: {
       flexDirection: 'row',
       flexWrap: 'wrap',
       gap: 10,
     },
     chapterCell: {
-      borderWidth: 1,
-      borderColor: theme.border,
-      backgroundColor: theme.surface,
+      borderWidth: 1.5,
+      borderColor: theme.isDark ? '#283548' : '#E2E8F0',
+      backgroundColor: theme.isDark ? '#172033' : '#F1F5F9',
       alignItems: 'center',
       justifyContent: 'center',
     },
     chapterCellActive: { backgroundColor: theme.primary, borderColor: theme.primary },
-    chapterCellText: { color: theme.text, fontSize: 15, fontWeight: '600' },
-    chapterCellTextActive: { color: theme.primaryForeground },
+    chapterCellText: {
+      color: theme.text,
+      fontSize: 16,
+      fontWeight: '600',
+      fontVariant: ['tabular-nums'],
+    },
+    chapterCellTextActive: { color: '#FFFFFF', fontWeight: '800' },
     setupOverlay: {
       position: 'absolute',
       top: 0,

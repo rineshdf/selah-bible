@@ -20,6 +20,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  StatusBar,
   StyleSheet,
   Text,
   TextInput,
@@ -141,8 +142,18 @@ function VersePickerBody({
   const tileWidth = Math.floor(
     (screenWidth - gridPadding * 2 - gridGap * (gridCols - 1)) / gridCols,
   );
-  /** Header padding that keeps the header clear of the status bar with no dead gap. */
-  const modalHeaderTop = Platform.OS === 'android' ? 8 : insets.top + 6;
+  /**
+   * Guaranteed top inset for the full-screen <Modal> header. Android
+   * edge-to-edge renders modal windows behind the status bar and camera
+   * cutout, so `insets.top` alone is not enough: take the platform status bar
+   * height too and enforce a 36px floor so the ‹ Back, stage title, and ✕
+   * Close always sit safely below the clock, center cutout, and battery icon.
+   */
+  const topModalInset = Math.max(
+    insets.top,
+    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 36) : 0,
+    36,
+  );
 
   const [stage, setStage] = useState<Stage>('version');
   const [versions, setVersions] = useState<DownloadedVersionSummary[]>([]);
@@ -533,11 +544,11 @@ function VersePickerBody({
 
   return (
     <View style={[styles.screen, { backgroundColor: theme.background }]}>
-      {/* Header: back + stage label + close (sits right below the status bar) */}
+      {/* Header: back + stage label + close (sits safely below the status bar) */}
       <View
         style={[
           styles.header,
-          { paddingTop: modalHeaderTop, paddingBottom: 10 },
+          { paddingTop: topModalInset + 10, paddingBottom: 12 },
         ]}
       >
         {backTargets[stage] && selectedVersion ? (
@@ -731,7 +742,7 @@ function VersePickerBody({
               (chapter) => (
                 <ScalePressable
                   key={chapter}
-                  style={[styles.chapterCell, { width: tileWidth, height: 50, borderRadius: 12 }]}
+                  style={[styles.chapterCell, { width: tileWidth, height: 50 }]}
                   onPress={() => chooseChapter(chapter)}
                   accessibilityRole="button"
                   accessibilityLabel={`${selectedBook.englishName} chapter ${chapter}`}
@@ -837,7 +848,7 @@ function makeStyles(theme: AppTheme) {
       alignItems: 'center',
       gap: 12,
       paddingHorizontal: 16,
-      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomWidth: 1,
       borderBottomColor: theme.border,
       backgroundColor: theme.surface,
     },
@@ -948,16 +959,26 @@ function makeStyles(theme: AppTheme) {
       flexDirection: 'row',
       flexWrap: 'wrap',
       gap: 10,
-      paddingTop: 8,
+      paddingTop: 16,
+      paddingBottom: 32,
     },
+    // Rounded squircle 5-column chapter tiles (unified with Home & Progress)
     chapterCell: {
-      borderWidth: 1,
-      borderColor: theme.border,
-      backgroundColor: theme.surface,
+      borderWidth: 1.5,
+      borderColor: theme.isDark ? '#283548' : '#E2E8F0',
+      backgroundColor: theme.isDark ? '#172033' : '#F1F5F9',
       alignItems: 'center',
       justifyContent: 'center',
+      borderRadius: 14,
     },
-    chapterCellText: { color: theme.text, fontSize: 15, fontWeight: '600' },
+    chapterCellActive: { backgroundColor: '#10B981', borderColor: '#10B981' },
+    chapterCellText: {
+      color: theme.text,
+      fontSize: 16,
+      fontWeight: '700',
+      fontVariant: ['tabular-nums'],
+    },
+    chapterCellTextActive: { color: '#FFFFFF', fontWeight: '800' },
     verseRow: {
       paddingVertical: 8,
       paddingHorizontal: 8,

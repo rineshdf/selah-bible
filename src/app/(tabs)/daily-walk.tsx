@@ -192,7 +192,11 @@ export default function DailyWalkScreen() {
   const { theme, colors, themeMode, toggleTheme } = useAppTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
-  const topInset = Math.max(insets.top, Platform.OS === 'android' ? (StatusBar.currentHeight ?? 28) : 0, 28);
+  const topModalInset = Math.max(
+    insets.top,
+    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 36) : 0,
+    36,
+  );
 
   const { width: screenWidth } = useWindowDimensions();
   const H_PAD = 14;
@@ -690,7 +694,7 @@ export default function DailyWalkScreen() {
   const weekContainsToday = weekDates(weekStart).includes(today);
 
   return (
-    <View style={[styles.screen, { backgroundColor: colors.background, paddingTop: topInset + 8 }]}>
+    <View style={[styles.screen, { backgroundColor: colors.background, paddingTop: topModalInset + 8 }]}>
       {/* FIX 5 — one unified header container: Rows 1-3 all share the exact
           14px left/right edges of the accordion cards below. */}
       <View style={styles.headerContainer}>
@@ -1211,7 +1215,7 @@ export default function DailyWalkScreen() {
       >
         <View style={[styles.rewindScreen, { backgroundColor: colors.background }]}>
           {/* Header: title + count badge · calendar filter · close */}
-          <View style={[styles.rewindHeader, { paddingTop: topInset + 8, backgroundColor: colors.background }]}>
+          <View style={[styles.rewindHeader, { paddingTop: topModalInset + 10, paddingBottom: 12, backgroundColor: colors.background }]}>
             <View style={styles.rewindHeaderTitleWrap}>
               <Text numberOfLines={1} style={styles.rewindTitle}>Rewind Past Days</Text>
               <View style={styles.rewindCountBadge}>
@@ -2308,7 +2312,6 @@ function makeStyles(theme: AppTheme) {
       justifyContent: 'space-between',
       gap: 10,
       paddingHorizontal: 16,
-      paddingVertical: 10,
       backgroundColor: theme.surface,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
