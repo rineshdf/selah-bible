@@ -1,4 +1,4 @@
-package com.anonymous.selahbible
+package com.rinesh.selahbible
 import expo.modules.splashscreen.SplashScreenManager
 
 import android.os.Build

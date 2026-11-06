@@ -1,4 +1,4 @@
-package com.anonymous.selahbible
+package com.rinesh.selahbible
 
 import android.app.Application
 import android.content.res.Configuration

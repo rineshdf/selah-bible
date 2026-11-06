@@ -49,7 +49,8 @@
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "monochromeImage": "./assets/images/adaptive-icon-monochrome.png"
       },
-      "package": "com.rinesh.selahbible"
+      "package": "com.rinesh.selahbible",
+      "versionCode": 3
     },
     "web": {
       "favicon": "./assets/favicon.png"
