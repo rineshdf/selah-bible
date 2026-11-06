@@ -1,6 +1,6 @@
 /**
  * Offline Bible file manager. Downloaded/seeded Bibles live in
- * `${FileSystem.documentDirectory}bibles/`:
+ * `${FileSystem.documentDirectory}SelahBible/bibles/` (see `storagePaths`):
  *
  * - `${versionId}.json`                  — whole-Bible (bundled seed or downloaded)
  * - `${versionId}.chapter.${b}.${c}.json`— helloao per-chapter payload cache
@@ -12,6 +12,7 @@
 
 import * as FileSystem from 'expo-file-system/legacy';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { SELAH_DIRS, initStorageDirectories } from '@/db/storagePaths';
 import {
   BUNDLED_VERSION_ID,
   fallbackJsonEndpoints,
@@ -554,7 +555,7 @@ function extractChapterVerses(
 // ---------------------------------------------------------------------------
 
 export function biblesDirectoryPath(): string {
-  return `${FileSystem.documentDirectory ?? ''}bibles/`;
+  return SELAH_DIRS.bibles;
 }
 
 /**
@@ -570,8 +571,9 @@ function safeFileStem(versionId: string): string {
 
 /**
  * Single source of truth for a version's offline JSON location:
- * `${FileSystem.documentDirectory}bibles/<safeStem>.json`. Used identically by
- * `downloadBibleVersion`, `getInstalledVersions` and `loadChapterVerses`.
+ * `${FileSystem.documentDirectory}SelahBible/bibles/<safeStem>.json`. Used
+ * identically by `downloadBibleVersion`, `getInstalledVersions` and
+ * `loadChapterVerses`.
  */
 export function getVersionFileUri(versionId: string): string {
   return `${biblesDirectoryPath()}${safeFileStem(versionId)}.json`;
@@ -588,9 +590,8 @@ function chapterCachePath(versionId: string, bookId: number, chapter: number): s
 
 /** Create the `bibles/` directory when missing (safe to call repeatedly). */
 export async function ensureBiblesDirectory(): Promise<string> {
-  const dir = biblesDirectoryPath();
-  await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
-  return dir;
+  await initStorageDirectories();
+  return biblesDirectoryPath();
 }
 
 /** Cheap check: does `bibles/TAMIL_BSI.json` exist with a full-Bible size? */

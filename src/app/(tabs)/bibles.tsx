@@ -58,6 +58,7 @@ import {
   restoreBackupFromUri,
   type SavedBackupItem,
 } from '@/db/backupManager';
+import { initStorageDirectories } from '@/db/storagePaths';
 import { ScalePressable } from '@/components/ScalePressable';
 import { BackupCloudSvg, SunMoonSvg } from '@/components/SvgIcons';
 
@@ -162,7 +163,8 @@ const LibraryRow = memo(function LibraryRow({
         accessibilityLabel={`${!isCollapsed ? 'Collapse' : 'Expand'} ${item.label}`}
       >
         <Text numberOfLines={1} style={styles.installedGroupTitle}>{item.label}</Text>
-        <View style={styles.groupHeaderRight}>
+        {/* pointerEvents none: whole header row stays one tap target. */}
+        <View style={styles.groupHeaderRight} pointerEvents="none">
           <View style={styles.installedGroupBadge}>
             <Text style={styles.installedGroupBadgeText}>{item.count}</Text>
           </View>
@@ -182,7 +184,8 @@ const LibraryRow = memo(function LibraryRow({
         accessibilityLabel={`${!isCollapsed ? 'Collapse' : 'Expand'} ${item.label}`}
       >
         <Text numberOfLines={1} style={styles.languageHeaderText}>{item.label}</Text>
-        <View style={styles.groupHeaderRight}>
+        {/* pointerEvents none: whole header row stays one tap target. */}
+        <View style={styles.groupHeaderRight} pointerEvents="none">
           <View style={styles.languageGroupBadge}>
             <Text style={styles.languageGroupBadgeText}>{item.count}</Text>
           </View>
@@ -359,6 +362,7 @@ export default function BiblesScreen() {
   }, []);
 
   const refresh = useCallback(async () => {
+    await initStorageDirectories();
     setActive(await getActiveVersionId());
     const metas = await getInstalledVersions();
     setInstalledMetas(metas);
@@ -685,7 +689,7 @@ export default function BiblesScreen() {
         fileName: res.fileName,
         displayPath: res.displayPath,
       });
-      Alert.alert('Backup Saved', `Saved in:\nDCIM/SelahBible/${res.dateFolder}/${res.fileName}`);
+      Alert.alert('Backup Saved', `Saved in:\n${res.displayPath}`);
       void refreshSavedBackups();
     } catch (error) {
       Alert.alert('Export failed', error instanceof Error ? error.message : 'Could not create the backup file.');
@@ -739,11 +743,20 @@ export default function BiblesScreen() {
   }, [refresh, refreshSavedBackups]);
 
   const toggleGroup = useCallback((groupKey: string) => {
-    setExpandedAvailableLangs((previous) => ({ ...previous, [groupKey]: !previous[groupKey] }));
+    setExpandedAvailableLangs((previous) => {
+      // Default state is expanded, so an untouched key flips to collapsed
+      // on the first tap instead of staying a no-op.
+      const currentIsExpanded = previous[groupKey] !== undefined ? previous[groupKey] : true;
+      return { ...previous, [groupKey]: !currentIsExpanded };
+    });
   }, []);
 
   const toggleInstalledGroup = useCallback((groupKey: string) => {
-    setExpandedAvailableLangs((previous) => ({ ...previous, [groupKey]: !previous[groupKey] }));
+    setExpandedAvailableLangs((previous) => {
+      // Installed groups default to expanded too — respect that default.
+      const currentIsExpanded = previous[groupKey] !== undefined ? previous[groupKey] : true;
+      return { ...previous, [groupKey]: !currentIsExpanded };
+    });
   }, []);
 
   /** Rows feed the memoized `LibraryRow`; every prop stays a stable ref. */
@@ -771,17 +784,16 @@ export default function BiblesScreen() {
     <View style={[styles.screen, { backgroundColor: theme.background }]}>
       {/* Task 2 — one unified header row: Left column (icon + title/subtitle
           stack, flex 1) and Right actions row (Backup pill + theme toggle,
-          flexShrink 0). numberOfLines + adjustsFontSizeToFit on the subtitle
+          flexShrink 0). numberOfLines + tail ellipsis on the subtitle
           guarantee zero overlap with the Backup pill on any screen width. */}
-      <View style={[styles.bibleLibraryHeader, { paddingTop: insets.top + 6 }]}>
+      <View style={[styles.bibleLibraryHeader, { paddingTop: insets.top + 8 }]}>
         <View style={styles.bibleLibraryHeaderLeft}>
           <SelahAppIconSvg size={24} color={theme.primary} />
           <View style={styles.bibleLibraryHeaderTitleColumn}>
             <Text numberOfLines={1} style={styles.bibleLibraryHeaderMainTitle}>Bible Library</Text>
             <Text
               numberOfLines={1}
-              adjustsFontSizeToFit
-              minimumFontScale={0.85}
+              ellipsizeMode="tail"
               style={styles.bibleLibraryHeaderSubtitle}
             >
               {`${totalValidVersionsCount.toLocaleString()} Versions in ${totalValidLanguagesCount.toLocaleString()} Languages`}
@@ -868,7 +880,7 @@ export default function BiblesScreen() {
                   <Text style={styles.savedConfirmationTitle}>✓ Backup Saved Successfully</Text>
                   <Text style={styles.savedConfirmationDetail}>
                     <Text style={styles.savedConfirmationLabel}>Folder: </Text>
-                    DCIM / SelahBible / {lastSavedBackupPath.dateFolder}
+                    Android / media / com.rinesh.selahbible / Backups / {lastSavedBackupPath.dateFolder}
                   </Text>
                   <Text style={styles.savedConfirmationDetail}>
                     <Text style={styles.savedConfirmationLabel}>File: </Text>
@@ -882,12 +894,12 @@ export default function BiblesScreen() {
                 onPress={() => void handleExportBackup()}
                 disabled={backupBusy !== null}
                 accessibilityRole="button"
-                accessibilityLabel="Save Backup to DCIM"
+                accessibilityLabel="Save Backup to Device"
               >
                 {backupBusy === 'export' ? (
                   <ActivityIndicator size="small" color={theme.primaryForeground} />
                 ) : (
-                  <Text style={styles.exportButtonText}>Save Backup to DCIM</Text>
+                  <Text style={styles.exportButtonText}>Save Backup to Device</Text>
                 )}
               </ScalePressable>
 
@@ -896,12 +908,12 @@ export default function BiblesScreen() {
                 onPress={() => void handleRestoreBackup()}
                 disabled={backupBusy !== null}
                 accessibilityRole="button"
-                accessibilityLabel="Browse File from Storage (DCIM)"
+                accessibilityLabel="Browse File from Storage"
               >
                 {backupBusy === 'restore' ? (
                   <ActivityIndicator size="small" color={theme.primary} />
                 ) : (
-                  <Text style={styles.restoreButtonText}>Browse File from Storage (DCIM)</Text>
+                  <Text style={styles.restoreButtonText}>Browse File from Storage</Text>
                 )}
               </ScalePressable>
 
@@ -968,7 +980,7 @@ function makeStyles(theme: AppTheme) {
       flexDirection: 'row',
       alignItems: 'center',
       justifyContent: 'center',
-      gap: 6,
+      gap: 5,
       backgroundColor: theme.surface,
       borderWidth: 1,
       borderColor: theme.border,
@@ -991,7 +1003,8 @@ function makeStyles(theme: AppTheme) {
       justifyContent: 'space-between',
       gap: 10,
       paddingHorizontal: 14,
-      paddingBottom: 10,
+      paddingTop: 8,
+      paddingBottom: 12,
       backgroundColor: theme.surface,
       borderBottomWidth: StyleSheet.hairlineWidth,
       borderBottomColor: theme.border,
@@ -1015,16 +1028,19 @@ function makeStyles(theme: AppTheme) {
       justifyContent: 'center',
     },
     bibleLibraryHeaderMainTitle: {
-      fontSize: 19,
+      fontSize: 20,
       fontWeight: '800',
       color: theme.text,
-      lineHeight: 24,
+      lineHeight: 27,
+      includeFontPadding: false,
     },
     bibleLibraryHeaderSubtitle: {
       fontSize: 11.5,
+      lineHeight: 16,
       fontWeight: '600',
       color: theme.subtext,
-      marginTop: 1,
+      marginTop: 4,
+      includeFontPadding: false,
     },
     searchWrapper: { marginTop: 6 },
     searchInputRow: {

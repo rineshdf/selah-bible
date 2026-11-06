@@ -20,6 +20,7 @@ import {
   Platform,
   Pressable,
   ScrollView,
+  StatusBar,
   StyleSheet,
   Text,
   TextInput,
@@ -115,7 +116,12 @@ export default function VersePickerModal({
   onClose,
 }: VersePickerModalProps) {
   return (
-    <Modal visible={visible} animationType="slide" onRequestClose={onClose}>
+    <Modal
+      visible={visible}
+      animationType="slide"
+      statusBarTranslucent={true}
+      onRequestClose={onClose}
+    >
       {visible ? <VersePickerBody onInsert={onInsert} onClose={onClose} /> : null}
     </Modal>
   );
@@ -131,6 +137,12 @@ function VersePickerBody({
   onClose,
 }: Pick<VersePickerModalProps, 'onInsert' | 'onClose'>) {
   const insets = useSafeAreaInsets();
+  /** Shared top inset for the edge-to-edge full-screen modal: status bar /
+   *  notch height with a 34px Android floor (44px on iOS), +10px breath. */
+  const modalTopInset =
+    Platform.OS === 'android'
+      ? Math.max(StatusBar.currentHeight ?? 0, insets.top, 34)
+      : Math.max(insets.top, 44);
   const { theme } = useAppTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
 
@@ -532,10 +544,10 @@ function VersePickerBody({
         style={[
           styles.header,
           {
-            // The <Modal> is NOT statusBarTranslucent → Android already
-            // positions it below the status bar. Padding past the status bar
-            // again would paint a dead dark band above the header.
-            paddingTop: Platform.OS === 'android' ? 12 : insets.top + 8,
+            // Edge-to-edge (`statusBarTranslucent`): the modal draws under the
+            // status bar, so the header pad must clear it — status bar /
+            // notch height + a 10px breath.
+            paddingTop: modalTopInset + 10,
             paddingBottom: 12,
           },
         ]}

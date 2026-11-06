@@ -698,17 +698,21 @@ export default function ProgressScreen() {
       </ScrollView>
 
       {/* Chapter toggle modal (verse-aware read state) */}
-      <Modal visible={openBook !== null} animationType="slide" onRequestClose={() => setOpenBook(null)}>
+      <Modal
+        visible={openBook !== null}
+        animationType="slide"
+        statusBarTranslucent={true}
+        onRequestClose={() => setOpenBook(null)}
+      >
         {openBook ? (
           <View style={[styles.modalScreen, { backgroundColor: theme.background }]}>
             <View
               style={[
                 styles.modalHeader,
                 {
-                  // The full-screen <Modal> is not statusBarTranslucent, so
-                  // Android already places it below the status bar — pad a
-                  // small 12px instead of the status-bar band (dead space).
-                  paddingTop: Platform.OS === 'android' ? 12 : insets.top + 8,
+                  // Edge-to-edge: draw under the status bar and pad the header
+                  // by the measured status bar / notch height + a 10px breath.
+                  paddingTop: topModalInset + 10,
                   paddingBottom: 12,
                 },
               ]}

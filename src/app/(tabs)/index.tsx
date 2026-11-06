@@ -245,6 +245,22 @@ export default function BibleReaderScreen() {
    */
   const [pendingTargetVerse, setPendingTargetVerse] = useState<number | null>(null);
   /**
+   * Task 4 — mirrors `currentVisibleVerse` so the version-switch flow can
+   * capture the restore target synchronously, even mid-viewability callback.
+   */
+  const currentVisibleVerseRef = useRef(1);
+  useEffect(() => {
+    currentVisibleVerseRef.current = currentVisibleVerse;
+  }, [currentVisibleVerse]);
+  /**
+   * Task 4 — restore lock: while a version-switch restore is aligning the
+   * list, the viewability handler must not fight the programmatic scrolls.
+   */
+  const isRestoringVersePositionRef = useRef(false);
+  /** Ref twin of `pendingTargetVerse` so the alignment passes read the
+   * target without depending on effect closure timing. */
+  const pendingTargetVerseRef = useRef<number | null>(null);
+  /**
    * FIX 6 — a version switch onto a book/chapter the target version does not
    * carry. The reader asks first instead of erroring: continue on the current
    * version, or switch and jump to the target version's first book.
@@ -450,30 +466,56 @@ export default function BibleReaderScreen() {
     return () => clearTimeout(timer);
   }, [pendingJumpVerse, isLoadingChapter, verses]);
 
-  // FIX 6 — after a version switch, land on the SAME verse. Scrolls once the
-  // new chapter has loaded; a bad index falls back to the closest valid row.
+  // Task 4 — after a version switch, land on the SAME verse with three
+  // alignment passes so the restored position stays put once windowed
+  // rendering settles: an immediate pass, an 80ms recheck, and a 180ms
+  // final pass that unlocks viewability tracking.
   useEffect(() => {
     if (pendingTargetVerse === null || isLoadingChapter || verses.length === 0) return;
-    const targetVerse = pendingTargetVerse;
-    const timer = setTimeout(() => {
-      setPendingTargetVerse(null);
-      const found = verses.findIndex((verse) => verse.verse === targetVerse);
-      const targetIndex = found >= 0
-        ? found
-        : Math.max(0, Math.min(targetVerse - 1, verses.length - 1));
+    // Clamp inside the loaded chapter.
+    const targetVerse = Math.min(pendingTargetVerse, verses.length);
+    const found = verses.findIndex((verse) => verse.verse === targetVerse);
+    const targetIndex = found >= 0
+      ? found
+      : Math.max(0, Math.min(targetVerse - 1, verses.length - 1));
+
+    const alignOnce = () => {
+      if (targetIndex === 0) {
+        listRef.current?.scrollToOffset({ offset: 0, animated: false });
+        return;
+      }
       try {
-        listRef.current?.scrollToIndex({ index: targetIndex, animated: false });
-      } catch {
-        // onScrollToIndexFailed fallback: clamp onto the loaded rows.
         listRef.current?.scrollToIndex({
-          index: Math.max(0, Math.min(targetIndex, verses.length - 1)),
+          index: targetIndex,
           animated: false,
           viewPosition: 0,
+          viewOffset: 8,
+        });
+      } catch {
+        // Estimation failure: coarse offset parks us at the right row while
+        // `onScrollToIndexFailed` refines once rows measure in.
+        listRef.current?.scrollToOffset({
+          offset: Math.max(0, targetIndex * 48),
+          animated: false,
         });
       }
-      setCurrentVisibleVerse(Math.max(1, verses[targetIndex]?.verse ?? targetVerse));
-    }, 0);
-    return () => clearTimeout(timer);
+    };
+
+    const raf = requestAnimationFrame(alignOnce);
+    const pass80 = setTimeout(alignOnce, 80);
+    const pass180 = setTimeout(() => {
+      alignOnce();
+      // Finalize: unlock scroll tracking and clear the pending target.
+      isRestoringVersePositionRef.current = false;
+      pendingTargetVerseRef.current = null;
+      setPendingTargetVerse(null);
+      setCurrentVisibleVerse(verses[targetIndex]?.verse ?? targetVerse);
+    }, 180);
+    return () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(pass80);
+      clearTimeout(pass180);
+    };
   }, [pendingTargetVerse, isLoadingChapter, verses]);
 
   // -----------------------------------------------------------------------
@@ -634,8 +676,16 @@ export default function BibleReaderScreen() {
         const entry = manifest.find((item) => item.bookId === bookId);
         const hasChapter = Boolean(entry) && chapter >= 1 && chapter <= (entry?.chapters ?? 0);
         if (hasChapter) {
-          // Case A: same verse lands in the new version.
-          setPendingTargetVerse(Math.max(1, Math.min(currentVisibleVerse, entry?.chapters ?? 0)));
+          // Case A: same verse lands in the new version. Capture the restore
+          // target synchronously and lock scroll tracking BEFORE the switch
+          // so the viewability handler can't fight the alignment passes.
+          const targetVerseToRestore = Math.max(
+            1,
+            Math.min(currentVisibleVerseRef.current || currentVisibleVerse || 1, entry?.chapters ?? 0),
+          );
+          isRestoringVersePositionRef.current = true;
+          pendingTargetVerseRef.current = targetVerseToRestore;
+          setPendingTargetVerse(targetVerseToRestore);
           commitVersionSwitch(newVersionId);
         } else {
           // Case B: ask before switching; the reader stays put by default.
@@ -669,6 +719,9 @@ export default function BibleReaderScreen() {
       commitVersionSwitch(target.targetVersionId);
       setBookId(firstBookId);
       setChapter(1);
+      // Task 4 — redirect restores verse 1 under the same restore lock.
+      isRestoringVersePositionRef.current = true;
+      pendingTargetVerseRef.current = 1;
       setPendingTargetVerse(1);
     })();
   }, [commitVersionSwitch, pendingVersionSwitch]);
@@ -945,6 +998,9 @@ export default function BibleReaderScreen() {
   /** Stable viewability callback for current visible verse indicator. */
   const viewableItemsHandler = useCallback(
     ({ viewableItems }: { viewableItems: { item: ChapterVerse }[] }) => {
+      // Task 4 — during a version-switch restore the programmatic alignment
+      // owns the scroll position; viewability must stay silent.
+      if (isRestoringVersePositionRef.current === true) return;
       const visibleVerses = viewableItems
         .map(({ item }) => item.verse)
         .filter((verse) => Number.isInteger(verse) && verse >= 1);
@@ -954,6 +1010,22 @@ export default function BibleReaderScreen() {
     },
     [],
   );
+
+  /** Task 4 — FlatList index estimation missed the rendered window: park at
+   *  a coarse offset, then retry the exact index once rows render in. */
+  const handleScrollToIndexFailed = useCallback((info: { index: number; averageItemLength: number }) => {
+    listRef.current?.scrollToOffset({
+      offset: info.averageItemLength * info.index,
+      animated: false,
+    });
+    setTimeout(() => {
+      listRef.current?.scrollToIndex({
+        index: info.index,
+        animated: false,
+        viewPosition: 0,
+      });
+    }, 50);
+  }, []);
 
   // --- Memoized verse row primitives ---------------------------------------
 
@@ -1107,12 +1179,17 @@ export default function BibleReaderScreen() {
 
       <FlatList
         ref={listRef}
+        // Task 4 — version-specific key: a version/chapter switch remounts
+        // the list with a clean render window instead of reusing the old
+        // one's measured rows.
+        key={`reader-${versionId}-${bookId}-${chapter}`}
         style={styles.verseList}
         contentContainerStyle={styles.verseListContent}
         data={verses}
         keyExtractor={verseKey}
         renderItem={renderVerse}
         onViewableItemsChanged={viewableItemsHandler}
+        onScrollToIndexFailed={handleScrollToIndexFailed}
         viewabilityConfig={CHAPTER_VIEWABILITY_CONFIG}
         initialNumToRender={15}
         maxToRenderPerBatch={15}
@@ -1191,6 +1268,7 @@ export default function BibleReaderScreen() {
       <Modal
         visible={pickerOpen}
         animationType="slide"
+        statusBarTranslucent={true}
         onRequestClose={() => setPickerOpen(false)}
       >
         <View style={[styles.pickerScreen, { backgroundColor: theme.background }]}>
@@ -1198,10 +1276,9 @@ export default function BibleReaderScreen() {
             style={[
               styles.pickerHeader,
               {
-                // The full-screen <Modal> is not statusBarTranslucent, so
-                // Android already places it below the status bar — padding to
-                // the status bar again would paint a dead dark band up here.
-                paddingTop: Platform.OS === 'android' ? 12 : insets.top + 8,
+                // Edge-to-edge: draw under the status bar and pad the header
+                // by the measured status bar / notch height + a 10px breath.
+                paddingTop: topModalInset + 10,
                 paddingBottom: 12,
                 paddingHorizontal: 16,
               },

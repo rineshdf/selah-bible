@@ -1723,10 +1723,12 @@ export default function DailyWalkScreen() {
                   <ScalePressable
                     style={styles.rewindSectionAccordion}
                     onPress={() => {
-                      setCollapsedRewindDates((prev) => ({
-                        ...prev,
-                        [section.dateIso]: !prev[section.dateIso],
-                      }));
+                      // Default state is expanded: an untouched key (undefined)
+                      // means expanded, first tap collapses it explicitly.
+                      setCollapsedRewindDates((prev) => {
+                        const currentIsCollapsed = prev[section.dateIso] !== undefined ? prev[section.dateIso] : false;
+                        return { ...prev, [section.dateIso]: !currentIsCollapsed };
+                      });
                     }}
                     accessibilityRole="button"
                     accessibilityState={{ expanded: !isCollapsed }}

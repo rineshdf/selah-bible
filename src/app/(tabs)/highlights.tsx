@@ -23,6 +23,7 @@ import {
   Pressable,
   ScrollView,
   SectionList,
+  StatusBar,
   StyleSheet,
   Text,
   View,
@@ -321,6 +322,13 @@ export default function HighlightsScreen() {
   const { theme } = useAppTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
+  /** Shared top inset for edge-to-edge full-screen modals (status bar +
+   *  notch), with a 36px floor so headers always clear the cutout. */
+  const topModalInset = Math.max(
+    insets.top,
+    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 36) : 0,
+    36,
+  );
 
   const [highlights, setHighlights] = useState<HighlightRow[]>([]);
   const [installedMetas, setInstalledMetas] = useState<BibleVersionMeta[]>([]);
@@ -787,16 +795,14 @@ export default function HighlightsScreen() {
       />
 
       {/* Full-screen chapter reader over the highlighted verse — 100% of the
-          screen, zero dead band above the header. `statusBarTranslucent={false}`
-          (the default, stated explicitly) makes the OS position the modal
-          window BELOW the status bar on Android, so the header only needs
-          tight padding — the old `topModalInset` band painted a blank
-          36-46px dark gap above `Close ✕` / `Genesis 1`. */}
+          screen, no dead band above the header. `statusBarTranslucent={true}`
+          draws the modal edge-to-edge under the status bar; the header pad
+          (`topModalInset + 10`) clears the clock, cutout, and battery icon. */}
       <Modal
         visible={contextHighlight !== null}
         animationType="slide"
         presentationStyle="fullScreen"
-        statusBarTranslucent={false}
+        statusBarTranslucent={true}
         onRequestClose={() => setContextHighlight(null)}
       >
         <View style={[styles.readerScreen, { backgroundColor: theme.background }]}>
@@ -806,7 +812,7 @@ export default function HighlightsScreen() {
             style={[
               styles.readerHeader,
               {
-                paddingTop: Platform.OS === 'android' ? 12 : Math.max(insets.top, 12),
+                paddingTop: topModalInset + 10,
                 paddingBottom: 12,
               },
             ]}

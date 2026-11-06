@@ -3,7 +3,7 @@
     "name": "Selah Bible",
     "slug": "selah-bible",
     "scheme": "selahbible",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "plugins": [
       "expo-router",
       [
@@ -36,7 +36,12 @@
     },
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.rinesh.selahbible",
+      "infoPlist": {
+        "UIFileSharingEnabled": true,
+        "LSSupportsOpeningDocumentsInPlace": true
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -44,7 +49,7 @@
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "monochromeImage": "./assets/images/adaptive-icon-monochrome.png"
       },
-      "package": "com.anonymous.selahbible"
+      "package": "com.rinesh.selahbible"
     },
     "web": {
       "favicon": "./assets/favicon.png"

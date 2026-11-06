@@ -1,8 +1,9 @@
 /**
  * Backup & restore for all SQLite tables in one JSON file.
  *
- * Saves backups into DCIM/SelahBible/<YYYY-MM-DD>/SelahBible_Backup_<YYYY-MM-DD>_<HH-mm-ss>.json
- * with both a local document copy and Android public DCIM copy (direct or SAF).
+ * Saves backups into Android/media/com.rinesh.selahbible/Backups/<YYYY-MM-DD>/SelahBible_Backup_<YYYY-MM-DD>_<HH-mm-ss>.json
+ * with both a sandbox local copy (SelahBible/backups/<date>/) and an Android
+ * public copy in the app's media folder (direct or SAF).
  *
  * Provides a 4-stage sandbox-safe URI reader (fetch -> XHR -> SAF -> FileSystem)
  * that permanently fixes the Expo Go DocumentPicker cache access error.
@@ -15,6 +16,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { SQLiteBindParams } from 'expo-sqlite';
 import { db, notifyProgressUpdated } from '@/db/database';
+import { SELAH_DIRS, selahBackupDirForDate, androidPublicBackupDirForDate, initStorageDirectories } from '@/db/storagePaths';
 
 // ---------------------------------------------------------------------------
 // Backup shape
@@ -166,8 +168,8 @@ export function getBackupTimestampParts(date = new Date()): {
   const dateFolder = `${yyyy}-${mm}-${dd}`;
   const timePart = `${hh}-${min}-${sec}`;
   const fileName = `SelahBible_Backup_${dateFolder}_${timePart}.json`;
-  const displayPath = `DCIM/SelahBible/${dateFolder}/${fileName}`;
-  const humanReadablePath = `Internal Storage/DCIM/SelahBible/${dateFolder}/${fileName}`;
+  const displayPath = `Android/media/com.rinesh.selahbible/Backups/${dateFolder}/${fileName}`;
+  const humanReadablePath = `Internal Storage/Android/media/com.rinesh.selahbible/Backups/${dateFolder}/${fileName}`;
 
   return { dateFolder, timePart, fileName, displayPath, humanReadablePath };
 }
@@ -227,36 +229,37 @@ async function findOrCreateSafDirectory(parentUri: string, dirName: string): Pro
 }
 
 /**
- * Save backup into DCIM/SelahBible/<YYYY-MM-DD>/SelahBible_Backup_<YYYY-MM-DD>_<HH-mm-ss>.json
+ * Save backup into Android/media/com.rinesh.selahbible/Backups/<YYYY-MM-DD>/SelahBible_Backup_<YYYY-MM-DD>_<HH-mm-ss>.json
  *
- * 1. Always saves local copy at `${FileSystem.documentDirectory}DCIM/SelahBible/${dateFolder}/${fileName}`.
- * 2. On Android, also saves to device's public DCIM/SelahBible/${dateFolder}/ via direct path or SAF.
+ * 1. Always saves local copy first at `SelahBible/backups/<dateFolder>/<fileName>`
+ *    inside the app sandbox (via `selahBackupDirForDate`).
+ * 2. On Android, also saves to the app's public media folder
+ *    `Android/media/com.rinesh.selahbible/Backups/<dateFolder>/` via direct
+ *    path or SAF (granted tree cached in `@selah_saf_backup_dir_uri`).
  *
- * Returns `{ success: true, fileName, displayPath: "DCIM/SelahBible/" + dateFolder + "/" + fileName, ... }`.
+ * Returns `{ success: true, fileName, displayPath: "Android/media/com.rinesh.selahbible/Backups/" + dateFolder + "/" + fileName, ... }`.
  */
 export async function exportBackup(): Promise<ExportBackupResult> {
+  await initStorageDirectories();
   const backup = buildBackupFile();
   const backupJsonString = JSON.stringify(backup, null, 2);
   const { dateFolder, fileName, displayPath, humanReadablePath } = getBackupTimestampParts();
 
-  // 1. Always save a local copy first at ${FileSystem.documentDirectory}DCIM/SelahBible/${dateFolder}/${fileName}
-  const docDir = FileSystem.documentDirectory?.endsWith('/')
-    ? FileSystem.documentDirectory
-    : `${FileSystem.documentDirectory ?? ''}/`;
-  const localDir = `${docDir}DCIM/SelahBible/${dateFolder}`;
+  // 1. Always save a local copy first at SelahBible/backups/<dateFolder>/<fileName>
+  const localDir = selahBackupDirForDate(dateFolder);
   await FileSystem.makeDirectoryAsync(localDir, { intermediates: true });
   const localPath = `${localDir}/${fileName}`;
   await FileSystem.writeAsStringAsync(localPath, backupJsonString, {
     encoding: FileSystem.EncodingType.UTF8,
   });
 
-  // 2. Next, save into the device's public DCIM/SelahBible/${dateFolder}/ folder on Android
+  // 2. Next, save into the app's public media folder on Android
   if (Platform.OS === 'android') {
     let publicSaved = false;
 
-    // Step A (Direct Public DCIM Path)
+    // Step A (Direct public media path — app-specific dirs need no permission)
     try {
-      const publicDir = `file:///storage/emulated/0/DCIM/SelahBible/${dateFolder}`;
+      const publicDir = androidPublicBackupDirForDate(dateFolder);
       await FileSystem.makeDirectoryAsync(publicDir, { intermediates: true });
       await FileSystem.writeAsStringAsync(`${publicDir}/${fileName}`, backupJsonString, {
         encoding: FileSystem.EncodingType.UTF8,
@@ -266,14 +269,14 @@ export async function exportBackup(): Promise<ExportBackupResult> {
       // Direct write restricted by Android Scoped Storage -> fallback to Step B
     }
 
-    // Step B (Android Scoped Storage SAF into DCIM)
+    // Step B (Android Scoped Storage SAF into the app's media folder)
     if (!publicSaved && FileSystem.StorageAccessFramework) {
       try {
-        let dcimUri = await AsyncStorage.getItem('@selah_dcim_saf_uri');
+        let treeUri = await AsyncStorage.getItem('@selah_saf_backup_dir_uri');
         let valid = false;
-        if (dcimUri) {
+        if (treeUri) {
           try {
-            await FileSystem.StorageAccessFramework.readDirectoryAsync(dcimUri);
+            await FileSystem.StorageAccessFramework.readDirectoryAsync(treeUri);
             valid = true;
           } catch {
             valid = false;
@@ -281,17 +284,17 @@ export async function exportBackup(): Promise<ExportBackupResult> {
         }
         if (!valid) {
           const perm = await FileSystem.StorageAccessFramework.requestDirectoryPermissionsAsync(
-            'content://com.android.externalstorage.documents/document/primary%3ADCIM',
+            'content://com.android.externalstorage.documents/document/primary%3AAndroid%2Fmedia%2Fcom.rinesh.selahbible',
           );
           if (perm.granted) {
-            dcimUri = perm.directoryUri;
-            await AsyncStorage.setItem('@selah_dcim_saf_uri', dcimUri);
+            treeUri = perm.directoryUri;
+            await AsyncStorage.setItem('@selah_saf_backup_dir_uri', treeUri);
             valid = true;
           }
         }
-        if (valid && dcimUri) {
-          const appFolderUri = await findOrCreateSafDirectory(dcimUri, 'SelahBible');
-          const dateFolderUri = await findOrCreateSafDirectory(appFolderUri, dateFolder);
+        if (valid && treeUri) {
+          const backupsFolderUri = await findOrCreateSafDirectory(treeUri, 'Backups');
+          const dateFolderUri = await findOrCreateSafDirectory(backupsFolderUri, dateFolder);
           const safFileUri = await FileSystem.StorageAccessFramework.createFileAsync(
             dateFolderUri,
             fileName,
@@ -306,7 +309,7 @@ export async function exportBackup(): Promise<ExportBackupResult> {
         // Scoped storage error handled; local copy is already securely written
       }
     }
-  } else if (Platform.OS === 'ios' && Sharing.isAvailableAsync) {
+  } else if (Platform.OS === 'ios') {
     try {
       const available = await Sharing.isAvailableAsync();
       if (available) {
@@ -544,14 +547,12 @@ export async function restoreBackupFromPicker(): Promise<RestoreResult | null> {
 }
 
 /**
- * Scan `${FileSystem.documentDirectory}DCIM/SelahBible/` for saved backups.
+ * Scan the sandbox `SelahBible/backups/` folder for saved backups.
  */
 export async function listLocalBackups(): Promise<SavedBackupItem[]> {
+  await initStorageDirectories();
   const items: SavedBackupItem[] = [];
-  const docDir = FileSystem.documentDirectory?.endsWith('/')
-    ? FileSystem.documentDirectory
-    : `${FileSystem.documentDirectory ?? ''}/`;
-  const baseDir = `${docDir}DCIM/SelahBible/`;
+  const baseDir = SELAH_DIRS.backups;
 
   try {
     const baseInfo = await FileSystem.getInfoAsync(baseDir);
@@ -574,7 +575,7 @@ export async function listLocalBackups(): Promise<SavedBackupItem[]> {
                 uri: fileUri,
                 fileName: file,
                 dateFolder: entry,
-                displayPath: `DCIM/SelahBible/${entry}/${file}`,
+                displayPath: `SelahBible/Backups/${entry}/${file}`,
                 size: fileInfo.exists && !fileInfo.isDirectory ? fileInfo.size : undefined,
                 modificationTime: fileInfo.exists && !fileInfo.isDirectory ? fileInfo.modificationTime : undefined,
               });
@@ -586,7 +587,7 @@ export async function listLocalBackups(): Promise<SavedBackupItem[]> {
           uri: entryUri,
           fileName: entry,
           dateFolder: '',
-          displayPath: `DCIM/SelahBible/${entry}`,
+          displayPath: `SelahBible/Backups/${entry}`,
           size: entryInfo.exists && !entryInfo.isDirectory ? entryInfo.size : undefined,
           modificationTime: entryInfo.exists && !entryInfo.isDirectory ? entryInfo.modificationTime : undefined,
         });
