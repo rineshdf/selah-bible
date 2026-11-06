@@ -43,16 +43,38 @@ function StrokeSvg({
 }
 
 // ---------------------------------------------------------------------------
-// BibleBookSvg — closed book with a spine and a cross on the cover
+// BibleBookSvg — symmetrical open scripture book centered at x = 12 with a
+// symmetrical cross above the center spine (Daily Devotion icon)
 // ---------------------------------------------------------------------------
 
 export function BibleBookSvg(props: SvgIconProps) {
+  const color = props.color ?? DEFAULT_COLOR;
   return (
-    <StrokeSvg {...props}>
-      <Path d="M4.5 19.5V5.5A2.5 2.5 0 0 1 7 3h11.5a1 1 0 0 1 1 1v13" />
-      <Path d="M4.5 19.5A2.5 2.5 0 0 1 7 17h12.5a1 1 0 0 1 1 1v2.5a1 1 0 0 1-1 1H7a2.5 2.5 0 0 1-2.5-2.5Z" />
-      <Path d="M11.25 7v5M9 9.5h4.5" />
-    </StrokeSvg>
+    <Svg width={props.size ?? 24} height={props.size ?? 24} viewBox="0 0 24 24" fill="none">
+      {/* Left page — exact mirror of the right page across x = 12. */}
+      <Path
+        d="M12 6.5C9.5 5.4 6.2 5.4 3.5 6.4V18.2C6.2 17.2 9.5 17.2 12 18.4"
+        stroke={color}
+        strokeWidth={1.8}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill={color + '22'}
+      />
+      {/* Right page. */}
+      <Path
+        d="M12 6.5C14.5 5.4 17.8 5.4 20.5 6.4V18.2C17.8 17.2 14.5 17.2 12 18.4"
+        stroke={color}
+        strokeWidth={1.8}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill={color + '22'}
+      />
+      {/* Center spine exactly on the symmetry axis. */}
+      <Path d="M12 6.5V18.4" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
+      {/* Symmetrical rays / cross at top center (x = 12). */}
+      <Path d="M12 2.5V4.8" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
+      <Path d="M10.4 3.6H13.6" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
+    </Svg>
   );
 }
 
@@ -102,30 +124,62 @@ export function DailyAltarSvg(props: SvgIconProps) {
 }
 
 // ---------------------------------------------------------------------------
-// SparkleRhemaSvg — four-point sparkle with a small star
+// SparkleRhemaSvg — 100% symmetrical 4-point radiant star centered exactly on
+// (12, 12) with a solid core circle — points symmetric on both axes (Rhema)
 // ---------------------------------------------------------------------------
 
 export function SparkleRhemaSvg(props: SvgIconProps) {
+  const color = props.color ?? DEFAULT_COLOR;
   return (
-    <StrokeSvg {...props}>
-      <Path d="M12 4l1.7 4.8L18.5 10.5l-4.8 1.7L12 17l-1.7-4.8L5.5 10.5l4.8-1.7Z" />
-      <Path d="M18.5 16.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8Z" />
-    </StrokeSvg>
+    <Svg width={props.size ?? 24} height={props.size ?? 24} viewBox="0 0 24 24" fill="none">
+      {/*
+       * Four-point star with points at (12, 2.5), (21.5, 12), (12, 21.5) and
+       * (2.5, 12); inner vertices mirrored at ±2.3 on both axes around 12 —
+       * perfectly symmetric horizontally and vertically.
+       */}
+      <Path
+        d="M12 2.5L14.3 9.7L21.5 12L14.3 14.3L12 21.5L9.7 14.3L2.5 12L9.7 9.7Z"
+        stroke={color}
+        strokeWidth={1.8}
+        strokeLinejoin="round"
+        fill={color + '22'}
+      />
+      {/* Solid core circle at the exact visual center. */}
+      <Circle cx="12" cy="12" r="1.4" fill={color} stroke="none" />
+    </Svg>
   );
 }
 
 // ---------------------------------------------------------------------------
-// PrayerHandsSvg — two praying hands mirrored around a center line
+// PrayerHandsSvg — symmetrical "Heart to God" emblem centered at x = 12: a
+// heart at the center framed by mirrored uplifted worship arcs, with a
+// radiant dot at the top center (Prayer & Worship icon)
 // ---------------------------------------------------------------------------
 
 export function PrayerHandsSvg(props: SvgIconProps) {
+  const color = props.color ?? DEFAULT_COLOR;
   return (
-    <StrokeSvg {...props}>
-      <Path d="M11 20.5c-3.4-1.6-5.5-4-5.5-7.5V6.2A1.7 1.7 0 0 1 8.9 6v4.6c0 .5.4.9.9.9s.9-.4.9-.9V6.2A1.7 1.7 0 0 1 13.4 6" />
-      <Path d="M13 20.5c3.4-1.6 5.5-4 5.5-7.5" />
-      <Path d="M12 20.5v-3.2M9.2 20.5h5.6" />
-      <Path d="M13.4 6v4.6c0 .5.4.9.9.9s.9-.4.9-.9V6.2A1.7 1.7 0 0 0 13.4 6" />
-    </StrokeSvg>
+    <Svg width={props.size ?? 24} height={props.size ?? 24} viewBox="0 0 24 24" fill="none">
+      {/*
+       * Center heart, mirrored left/right of x = 12: left lobe descends to a
+       * point at (12, 15.8); the top edge crosses the axis symmetrically at
+       * (12, 7.45).
+       */}
+      <Path
+        d="M12 15.8C12 15.8 7.5 12.6 7.5 9.5C7.5 7.8 8.8 6.5 10.3 6.5C11.1 6.5 11.7 6.9 12 7.5C12.3 6.9 12.9 6.5 13.7 6.5C15.2 6.5 16.5 7.8 16.5 9.5C16.5 12.6 12 15.8 12 15.8Z"
+        stroke={color}
+        strokeWidth={1.8}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill={color + '22'}
+      />
+      {/* Uplifted worship arc, left — exact mirror of the right arc. */}
+      <Path d="M4.5 13.5C4.5 17.4 7.8 20 12 20" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
+      {/* Uplifted worship arc, right. */}
+      <Path d="M19.5 13.5C19.5 17.4 16.2 20 12 20" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
+      {/* Radiant dot directly above the heart on the symmetry axis. */}
+      <Circle cx="12" cy="3.5" r="1.1" fill={color} stroke="none" />
+    </Svg>
   );
 }
 
@@ -482,15 +536,50 @@ export function TabVersionsSvg({ color, size = 24, focused = false }: TabIconPro
 }
 
 // ---------------------------------------------------------------------------
-// ChecklistSvg — checked list card (Prayer Points card icon)
+// ChecklistSvg — symmetrical Prayer Requests & Answers tablet centered at
+// x = 12: rounded frame, top notch header, centered checkmark and two
+// symmetrical lines (Prayer Points icon)
 // ---------------------------------------------------------------------------
 
 export function ChecklistSvg(props: SvgIconProps) {
+  const color = props.color ?? DEFAULT_COLOR;
   return (
-    <StrokeSvg {...props}>
-      <Rect x="4" y="4" width="16" height="16" rx="3" />
-      <Path d="M7.5 8.5l1.2 1.2 2-2.2M7.5 13.5l1.2 1.2 2-2.2M7.5 17l1.2 1.2 2-2.2" />
-      <Path d="M13.5 9h3M13.5 13.5h3M13.5 17.5h3" />
-    </StrokeSvg>
+    <Svg width={props.size ?? 24} height={props.size ?? 24} viewBox="0 0 24 24" fill="none">
+      {/* Symmetrical rounded frame (4.5..19.5 horizontally, centered at 12). */}
+      <Rect
+        x="4.5"
+        y="3.5"
+        width="15"
+        height="17"
+        rx="3"
+        stroke={color}
+        strokeWidth={1.8}
+        fill="none"
+      />
+      {/* Symmetrical top header notch centered on x = 12. */}
+      <Path d="M9 3.5H15" stroke={color} strokeWidth={2.4} strokeLinecap="round" />
+      {/* Centered checkmark around (12, 9.5). */}
+      <Path d="M9.8 9.8L11.3 11.3L14.4 8.2" stroke={color} strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" />
+      {/* Two symmetrical lines below, centered on x = 12. */}
+      <Path d="M8 14.5H16" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
+      <Path d="M9.5 17.2H14.5" stroke={color} strokeWidth={1.8} strokeLinecap="round" />
+    </Svg>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Descriptive aliases — each Daily Walk section has a semantic name, while the
+// exported components above keep their original (imports-compatible) names.
+// ---------------------------------------------------------------------------
+
+/** Alias of SparkleRhemaSvg — symmetrical radiant star (Rhema). */
+export { SparkleRhemaSvg as RhemaSparkleSvg };
+
+/** Alias of BibleBookSvg — symmetrical open book (Daily Devotion). */
+export { BibleBookSvg as DevotionBookSvg };
+
+/** Alias of PrayerHandsSvg — symmetrical heart-in-hands (Prayer & Worship). */
+export { PrayerHandsSvg as PrayerWorshipSvg };
+
+/** Alias of ChecklistSvg — symmetrical requests tablet (Prayer Points). */
+export { ChecklistSvg as PrayerPointsSvg };

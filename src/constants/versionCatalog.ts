@@ -15,6 +15,19 @@ export const HELLOAO_API_BASE = 'https://bible.helloao.org/api';
 
 export const AVAILABLE_TRANSLATIONS_URL = `${HELLOAO_API_BASE}/available_translations.json`;
 
+/**
+ * Free whole-Bible JSON mirrors used as multi-source download fallbacks
+ * (verified 2026-11-05):
+ * - `thiagobodruk` — 66-book canonical-order volumes `{abbrev, chapters: [[text...]]}`
+ * - `getbible` — `{translation, books: [{nr, name, chapters: [{chapter, verses: [{verse, text}]}]}]}`
+ * - `godlytalias` — `{Book: [{BookName, Chapter: [[{Verse: "..."}]]}]}` (Indian languages)
+ */
+export const THIAGOBODRUK_JSON_BASE =
+  'https://raw.githubusercontent.com/thiagobodruk/bible/master/json';
+export const GETBIBLE_API_BASE = 'https://api.getbible.net/v2';
+export const GODLYTALIAS_BASE =
+  'https://raw.githubusercontent.com/godlytalias/Bible-Database/master';
+
 /** Whole-Bible Tamil JSON mirror used to materialize the first-launch copy. */
 export const TAMIL_BSI_DOWNLOAD_URL =
   'https://raw.githubusercontent.com/godlytalias/Bible-Database/master/Tamil/bible.json';
@@ -129,6 +142,26 @@ export const DEFAULT_VERSIONS: DownloadableVersion[] = [
     helloaoTranslationId: 'eng_bbe',
   },
   {
+    id: 'eng_asv',
+    name: 'American Standard Version',
+    shortName: 'ASV',
+    englishName: 'American Standard Version',
+    languageName: 'English',
+    languageCode: 'eng',
+    source: 'helloao',
+    helloaoTranslationId: 'eng_asv',
+  },
+  {
+    id: 'eng_bsb',
+    name: 'Berean Study Bible',
+    shortName: 'BSB',
+    englishName: 'Berean Study Bible',
+    languageName: 'English',
+    languageCode: 'eng',
+    source: 'json',
+    downloadUrl: `${THIAGOBODRUK_JSON_BASE}/en_bsb.json`,
+  },
+  {
     id: 'HINIRV',
     name: 'Hindi IRV Bible',
     shortName: 'Hindi IRV',
@@ -179,24 +212,73 @@ export const DEFAULT_VERSIONS: DownloadableVersion[] = [
     helloaoTranslationId: 'spa_pdt',
   },
   {
-    id: 'spa_rvr',
-    name: 'Reina Valera 1909',
-    shortName: 'RVR',
-    englishName: 'Reina Valera 1909',
+    /**
+     * Reina-Valera has NO helloao mirror id (`spa_rvr` is dead — bible.helloao.org
+     * returns 404 for it), so it downloads from the thiagobodruk full-Bible
+     * JSON with a getbible.net fallback (see `FALLBACK_JSON_SOURCES`).
+     */
+    id: 'spa_rvr1960',
+    name: 'Reina Valera 1960',
+    shortName: 'RVR1960',
+    englishName: 'Reina Valera 1960',
+    languageName: 'Spanish',
+    languageCode: 'spa',
+    source: 'json',
+    downloadUrl: `${THIAGOBODRUK_JSON_BASE}/es_rvr1960.json`,
+  },
+  {
+    id: 'spa_rvg',
+    name: 'Reina Valera Godoy',
+    shortName: 'RVG',
+    englishName: 'Reina Valera Godoy Bible',
     languageName: 'Spanish',
     languageCode: 'spa',
     source: 'helloao',
-    helloaoTranslationId: 'spa_rvr',
+    helloaoTranslationId: 'spa_rvg',
   },
   {
-    id: 'heb_mas',
-    name: 'Masoretic Hebrew Text (תנ״ך)',
-    shortName: 'MAS',
-    englishName: 'Hebrew Masoretic Old Testament',
+    /** Masoretic Hebrew via the Westminster Leningrad Codex (verified helloao id). */
+    id: 'heb_wlc',
+    name: 'תנ״ך Masoretic Hebrew (WLC)',
+    shortName: 'WLC',
+    englishName: 'Hebrew Westminster Leningrad Codex',
     languageName: 'Hebrew',
     languageCode: 'heb',
     source: 'helloao',
-    helloaoTranslationId: 'heb_mas',
+    helloaoTranslationId: 'heb_wlc',
+  },
+  {
+    /** Aleppo Codex (unpointed Hebrew OT) via the verified getbible v2 mirror. */
+    id: 'heb_aleppo',
+    name: 'כתר ארם־צובה — Aleppo Codex',
+    shortName: 'Aleppo',
+    englishName: 'Hebrew Aleppo Codex (OT)',
+    languageName: 'Hebrew',
+    languageCode: 'heb',
+    source: 'json',
+    downloadUrl: `${GETBIBLE_API_BASE}/aleppo.json`,
+  },
+  {
+    /** Modern Hebrew Bible via the verified getbible v2 mirror. */
+    id: 'heb_modern',
+    name: 'Modern Hebrew Bible',
+    shortName: 'ModHeb',
+    englishName: 'Modern Hebrew Bible',
+    languageName: 'Hebrew',
+    languageCode: 'heb',
+    source: 'json',
+    downloadUrl: `${GETBIBLE_API_BASE}/modernhebrew.json`,
+  },
+  {
+    /** Greek New Testament: Textus Receptus (verified helloao id `grc_gtr`). */
+    id: 'grc_gtr',
+    name: 'Greek New Testament — Textus Receptus',
+    shortName: 'GTR',
+    englishName: 'Greek NT Textus Receptus',
+    languageName: 'Greek',
+    languageCode: 'grc',
+    source: 'helloao',
+    helloaoTranslationId: 'grc_gtr',
   },
 ];
 
@@ -602,7 +684,8 @@ export async function getMergedCatalogVersions(): Promise<DownloadableVersion[]>
   for (const version of online) {
     if (!merged.has(version.id)) merged.set(version.id, version);
   }
-  return [...merged.values()];
+  // Pre-filter: dead/failed ids and endpoint-less entries never render.
+  return filterKnownFailedVersions([...merged.values()]);
 }
 
 /** AsyncStorage read/write helpers — isolated so tests can stub them. */
@@ -641,7 +724,8 @@ async function saveHelloaoCache(versions: DownloadableVersion[]): Promise<void> 
 export async function searchOnlineTranslations(query: string): Promise<DownloadableVersion[]> {
   const cached = await loadHelloaoCache();
   if (cached && Date.now() - cached.at < TRANSLATIONS_CACHE_TTL_MS) {
-    return filterVersions(query, cached.versions);
+    const usable = await filterKnownFailedVersions(cached.versions);
+    return filterVersions(query, usable);
   }
 
   let versions: DownloadableVersion[];
@@ -649,8 +733,12 @@ export async function searchOnlineTranslations(query: string): Promise<Downloada
     // Shared one-flight fetcher — also refreshes the cached catalog file.
     versions = await refreshOnlineCatalog();
     await saveHelloaoCache(versions);
+    versions = await filterKnownFailedVersions(versions);
   } catch {
-    if (cached) return filterVersions(query, cached.versions);
+    if (cached) {
+      const usable = await filterKnownFailedVersions(cached.versions);
+      return filterVersions(query, usable);
+    }
     throw new Error('Online translation search failed. Check your internet connection.');
   }
   return filterVersions(query, versions);
@@ -663,4 +751,280 @@ export function findDefaultVersion(id: string): DownloadableVersion | undefined 
     const versionId = version.id.toLowerCase().replace(/[\s_.-]+/g, '');
     return versionId === normalized || (version.id === BUNDLED_VERSION_ID && normalized === 'bsi');
   });
+}
+
+// ---------------------------------------------------------------------------
+// Multi-source download fallback endpoints
+// ---------------------------------------------------------------------------
+
+/**
+ * Alternate whole-Bible JSON mirrors per version id (and its legacy ids), so a
+ * redirected dead helloao translation can still be materialized: the
+ * downloader walks helloao `complete.simple.json` first, then every fallback
+ * URL, then the on-demand skeleton. All shapes are parsed by
+ * `normalizeAnyBiblePayload` (getbible / thiagobodruk / godlytalias).
+ */
+export const FALLBACK_JSON_SOURCES: Readonly<Record<string, readonly string[]>> = {
+  // English — KJV / WEB / BSB / ASV / BBE
+  eng_kjv: [
+    `${GETBIBLE_API_BASE}/kjv.json`,
+    `${THIAGOBODRUK_JSON_BASE}/en_kjv.json`,
+    `${GODLYTALIAS_BASE}/English/bible.json`,
+  ],
+  eng_asv: [`${GETBIBLE_API_BASE}/asv.json`, `${THIAGOBODRUK_JSON_BASE}/en_asv.json`],
+  ENGWEBP: [`${GETBIBLE_API_BASE}/web.json`, `${THIAGOBODRUK_JSON_BASE}/en_web.json`],
+  eng_web: [`${GETBIBLE_API_BASE}/web.json`, `${THIAGOBODRUK_JSON_BASE}/en_web.json`],
+  eng_bbe: [`${GETBIBLE_API_BASE}/basicenglish.json`, `${THIAGOBODRUK_JSON_BASE}/en_bbe.json`],
+  eng_bsb: [`${THIAGOBODRUK_JSON_BASE}/en_bsb.json`],
+  // Spanish RVR
+  spa_rvr1960: [`${GETBIBLE_API_BASE}/valera.json`],
+  spa_rvr: [`${GETBIBLE_API_BASE}/valera.json`, `${THIAGOBODRUK_JSON_BASE}/es_rvr1960.json`],
+  // Hebrew WLC / Greek Textus Receptus
+  heb_wlc: [
+    `${THIAGOBODRUK_JSON_BASE}/he_wlc.json`,
+    `${GETBIBLE_API_BASE}/codex.json`,
+    `${GETBIBLE_API_BASE}/aleppo.json`,
+    `${GETBIBLE_API_BASE}/modernhebrew.json`,
+  ],
+  heb_mas: [`${THIAGOBODRUK_JSON_BASE}/he_wlc.json`, `${GETBIBLE_API_BASE}/codex.json`],
+  // Additional verified Hebrew codices (GetBible v2, both RTL Hebrew)
+  heb_aleppo: [`${GETBIBLE_API_BASE}/aleppo.json`, `${GETBIBLE_API_BASE}/codex.json`],
+  heb_modern: [`${GETBIBLE_API_BASE}/modernhebrew.json`, `${GETBIBLE_API_BASE}/codex.json`],
+  grc_gtr: [`${THIAGOBODRUK_JSON_BASE}/grc_grctr.json`],
+  // Indian IRV languages reinstallable from the godlytalias mirror
+  tam_irv: [`${GODLYTALIAS_BASE}/Tamil/bible.json`],
+  HINIRV: [`${GODLYTALIAS_BASE}/Hindi/bible.json`],
+  hin_irv: [`${GODLYTALIAS_BASE}/Hindi/bible.json`],
+  mal_irv: [`${GODLYTALIAS_BASE}/Malayalam/bible.json`],
+  tel_irv: [`${GODLYTALIAS_BASE}/Telugu/bible.json`],
+  kan_irv: [`${GODLYTALIAS_BASE}/Kannada/bible.json`],
+  ben_irv: [`${GODLYTALIAS_BASE}/Bengali/bible.json`],
+  guj_irv: [`${GODLYTALIAS_BASE}/Gujarati/bible.json`],
+  mar_irv: [`${GODLYTALIAS_BASE}/Marathi/bible.json`],
+  ory_irv: [`${GODLYTALIAS_BASE}/Oriya/bible.json`],
+  pan_irv: [`${GODLYTALIAS_BASE}/Punjabi/bible.json`],
+};
+
+/**
+ * Fallback whole-Bible JSON URLs for a version id, helloao translation id and
+ * legacy id spellings, ordered most-canonical first.
+ */
+export function fallbackJsonEndpoints(
+  versionId: string,
+  helloaoTranslationId?: string,
+): string[] {
+  const ids = [versionId, helloaoTranslationId ?? ''];
+  const seen = new Set<string>();
+  const urls: string[] = [];
+  for (const id of ids) {
+    for (const url of FALLBACK_JSON_SOURCES[id] ?? []) {
+      if (!seen.has(url)) {
+        seen.add(url);
+        urls.push(url);
+      }
+    }
+  }
+  return urls;
+}
+
+/**
+ * Quick structural gate for catalog rendering: a downloadable entry must
+ * carry at least one usable endpoint (helloao translation id or direct JSON
+ * URL); the bundled seed always passes.
+ */
+export function hasUsableDownloadEndpoint(version: DownloadableVersion): boolean {
+  if (version.source === 'bundled') return true;
+  if (version.source === 'json') return Boolean(version.downloadUrl);
+  return Boolean(version.helloaoTranslationId);
+}
+
+// ---------------------------------------------------------------------------
+// Failed versions (`@selah_invalid_versions`) + health probes
+// ---------------------------------------------------------------------------
+
+/**
+ * Persisted set of translation ids that were verified (or attempted) and are
+ * dead — dead helloao ids (`spa_rvr` returned 404), endpoint-less catalogs and
+ * downloads that produced zero books. Victims are removed from every version
+ * list the app renders.
+ */
+export const FAILED_VERSIONS_STORAGE_KEY = '@selah_invalid_versions';
+
+let failedVersionIdsMem: Set<string> | null = null;
+let failedVersionIdsLoad: Promise<Set<string>> | null = null;
+
+/** Load the persisted failure set (memory-cached, tolerates corrupt data). */
+export async function loadFailedVersionIds(): Promise<Set<string>> {
+  if (failedVersionIdsMem) return failedVersionIdsMem;
+  if (!failedVersionIdsLoad) {
+    failedVersionIdsLoad = (async () => {
+      try {
+        const AsyncStorage = (await import('@react-native-async-storage/async-storage')).default;
+        const raw = await AsyncStorage.getItem(FAILED_VERSIONS_STORAGE_KEY);
+        const parsed: unknown = raw ? JSON.parse(raw) : null;
+        failedVersionIdsMem = Array.isArray(parsed)
+          ? new Set(parsed.filter((entry): entry is string => typeof entry === 'string'))
+          : new Set<string>();
+        return failedVersionIdsMem;
+      } catch {
+        failedVersionIdsMem = new Set<string>();
+        return failedVersionIdsMem;
+      }
+    })().catch(() => {
+      failedVersionIdsMem = new Set<string>();
+      return failedVersionIdsMem;
+    }).finally(() => {
+      failedVersionIdsLoad = null;
+    });
+  }
+  const resolved = await failedVersionIdsLoad;
+  return resolved ?? failedVersionIdsMem ?? new Set<string>();
+}
+
+function addFailedVersionId(id: string): void {
+  const set = failedVersionIdsMem ?? new Set<string>();
+  set.add(id);
+  failedVersionIdsMem = set;
+}
+
+/** Remember a dead translation id so lists stop offering it. */
+export async function markVersionFailed(versionId: string): Promise<void> {
+  if (!versionId?.trim() || versionId === BUNDLED_VERSION_ID) return;
+  addFailedVersionId(versionId);
+  try {
+    const AsyncStorage = (await import('@react-native-async-storage/async-storage')).default;
+    await AsyncStorage.setItem(
+      FAILED_VERSIONS_STORAGE_KEY,
+      JSON.stringify([...(failedVersionIdsMem ?? new Set<string>())]),
+    );
+  } catch {
+    // Persistence failures must never break the render path.
+  }
+}
+
+/** Un-blacklist a version id (used when an install later succeeds). */
+export async function clearFailedVersion(versionId: string): Promise<void> {
+  const set = failedVersionIdsMem ?? (await loadFailedVersionIds());
+  if (!set.delete(versionId)) return;
+  try {
+    const AsyncStorage = (await import('@react-native-async-storage/async-storage')).default;
+    await AsyncStorage.setItem(FAILED_VERSIONS_STORAGE_KEY, JSON.stringify([...set]));
+  } catch {
+    // Ignore.
+  }
+}
+
+/** Drop entries whose id is persisted as failed, or which have no endpoint. */
+export async function filterKnownFailedVersions(
+  versions: DownloadableVersion[],
+): Promise<DownloadableVersion[]> {
+  const failed = await loadFailedVersionIds();
+  return versions.filter(
+    (version) =>
+      version.source === 'bundled' ||
+      (hasUsableDownloadEndpoint(version) && !failed.has(version.id)),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Health probe — `verifyVersionLoadable`
+// ---------------------------------------------------------------------------
+
+/** Probe verdict TTL: a healthy/dead answer is trusted for a day. */
+const LOADABILITY_PROBE_TTL_MS = 24 * 60 * 60 * 1000;
+/** Search screens render at most the first N probes per query refresh. */
+export const MAX_LOADABILITY_PROBES = 24;
+const probeConcurrency = 4;
+
+const loadabilityProbeCache = new Map<string, { ok: boolean; definitive: boolean; at: number }>();
+
+/**
+ * Health probe for one downloadable version: helloao ids read
+ * `books.json` and demand `numberOfBooks > 0`; JSON mirrors answer a HEAD
+ * request. Diagnostic 404/410s persist the id into `@selah_invalid_versions`
+ * so the UI auto-drops it; transient network errors never blacklist.
+ */
+export async function verifyVersionLoadable(version: DownloadableVersion): Promise<boolean> {
+  if (version.source === 'bundled') return true;
+  const id = version.id;
+  const cached = loadabilityProbeCache.get(id);
+  if (cached && Date.now() - cached.at < LOADABILITY_PROBE_TTL_MS) return cached.ok;
+
+  const failed = await loadFailedVersionIds();
+  if (failed.has(id)) {
+    loadabilityProbeCache.set(id, { ok: false, definitive: true, at: Date.now() });
+    return false;
+  }
+
+  let ok = false;
+  let definitive = false;
+  try {
+    if (version.source === 'json' && version.downloadUrl) {
+      const response = await fetch(version.downloadUrl, { method: 'HEAD' });
+      if (response.ok) {
+        ok = true;
+      } else if (response.status === 404 || response.status === 410) {
+        definitive = true;
+      }
+    } else {
+      const rawId = version.helloaoTranslationId || version.id;
+      const response = await fetch(`${HELLOAO_API_BASE}/${rawId}/books.json`);
+      if (response.ok) {
+        const payload = (await response.json()) as {
+          numberOfBooks?: unknown;
+          books?: unknown[];
+        };
+        const count = typeof payload.numberOfBooks === 'number'
+          ? payload.numberOfBooks
+          : Array.isArray(payload.books)
+            ? payload.books.length
+            : 0;
+        ok = count > 0;
+      } else if (response.status === 404 || response.status === 410) {
+        definitive = true;
+      }
+    }
+  } catch {
+    // Network error → not available right now, never blacklist.
+  }
+
+  loadabilityProbeCache.set(id, { ok, definitive, at: Date.now() });
+  if (!ok && definitive) await markVersionFailed(id);
+  return ok;
+}
+
+/**
+ * Health-probe a render-ready version list, preserving order, keeping at most
+ * `maxProbes` (default 24) network checks and dropping probing-confirmed
+ * dead ids. Entries beyond the probe cap pass through unverified so long
+ * result batches never stall the screen.
+ */
+export async function dropFailingVersions(
+  versions: DownloadableVersion[],
+  maxProbes: number = MAX_LOADABILITY_PROBES,
+): Promise<DownloadableVersion[]> {
+  if (versions.length === 0) return versions;
+  const targets = versions.slice(0, Math.max(0, maxProbes));
+  const verdicts: boolean[] = new Array(targets.length).fill(false);
+  let cursor = 0;
+
+  async function worker(): Promise<void> {
+    while (cursor < targets.length) {
+      const index = cursor;
+      cursor += 1;
+      try {
+        verdicts[index] = await verifyVersionLoadable(targets[index]);
+      } catch {
+        verdicts[index] = true; // probe errors keep the card renderable.
+      }
+    }
+  }
+
+  const workers: Promise<void>[] = [];
+  for (let index = 0; index < Math.min(probeConcurrency, targets.length); index += 1) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
+
+  return versions.filter((_, index) => index < maxProbes ? verdicts[index] : true);
 }

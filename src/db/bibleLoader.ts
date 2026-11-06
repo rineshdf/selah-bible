@@ -14,10 +14,13 @@ import * as FileSystem from 'expo-file-system/legacy';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
   BUNDLED_VERSION_ID,
+  fallbackJsonEndpoints,
   findDefaultVersion,
   fuzzyMatchScore,
   languageDisplayLabel,
   loadCachedOnlineCatalog,
+  markVersionFailed,
+  clearFailedVersion,
   POPULAR_BIBLE_VERSIONS,
   TAMIL_BSI_DOWNLOAD_URL,
   type DownloadableVersion,
@@ -28,6 +31,8 @@ import {
   getBookIdFromBookName,
   getBookIdFromUsfm,
   getUsfmBookCode,
+  isUsfmLikeBookName,
+  localizedBookNameFor,
   USFM_BOOK_CODES,
   type VersionBookMeta,
 } from '@/constants/books';
@@ -239,7 +244,13 @@ const KNOWN_RAW_VERSION_IDS: Record<string, KnownVersionMeta> = {
   'kan_irv': { name: 'Kannada Indian Revised Version Bible', shortName: 'Kannada IRV', languageName: 'Kannada', languageCode: 'kan' },
   'spa_pdt': { name: 'Palabra de Dios para Todos', shortName: 'PDT', languageName: 'Spanish', languageCode: 'spa' },
   'spa_rvr': { name: 'Reina Valera 1909', shortName: 'RVR', languageName: 'Spanish', languageCode: 'spa' },
+  'spa_rvr1960': { name: 'Reina Valera 1960', shortName: 'RVR1960', languageName: 'Spanish', languageCode: 'spa' },
+  'spa_rvg': { name: 'Reina Valera Godoy', shortName: 'RVG', languageName: 'Spanish', languageCode: 'spa' },
   'heb_mas': { name: 'Masoretic Hebrew Text', shortName: 'MAS', languageName: 'Hebrew', languageCode: 'heb' },
+  'heb_wlc': { name: 'Hebrew Westminster Leningrad Codex', shortName: 'WLC', languageName: 'Hebrew', languageCode: 'heb' },
+  'grc_gtr': { name: 'Greek New Testament — Textus Receptus', shortName: 'GTR', languageName: 'Greek', languageCode: 'grc' },
+  'eng_asv': { name: 'American Standard Version', shortName: 'ASV', languageName: 'English', languageCode: 'eng' },
+  'eng_bsb': { name: 'Berean Study Bible', shortName: 'BSB', languageName: 'English', languageCode: 'eng' },
   'PDT': { name: 'Palabra de Dios para Todos', shortName: 'PDT', languageName: 'Spanish', languageCode: 'spa' },
   'RVR': { name: 'Reina Valera 1909', shortName: 'RVR', languageName: 'Spanish', languageCode: 'spa' },
   'MAS': { name: 'Masoretic Hebrew Text', shortName: 'MAS', languageName: 'Hebrew', languageCode: 'heb' },
@@ -812,6 +823,25 @@ function usfmForBookId(bookId: number): string | null {
   return USFM_BY_BOOK_ID[bookId] ?? null;
 }
 
+/**
+ * Replace USFM-code book names (`MAT`, `2PE`, `GEN`, ...) with human display
+ * names: the version's language dictionary when it has one (Tamil, Spanish,
+ * Hebrew, German, French, Portuguese, ...), then the canonical English name.
+ * Real titles pass through untouched.
+ */
+function resolveBookDisplayName(
+  bookId: number,
+  rawName: string | undefined | null,
+  languageCode?: string | null,
+): string {
+  const name = (rawName ?? '').trim();
+  if (name && !isUsfmLikeBookName(name)) return name;
+  const localized = localizedBookNameFor(languageCode ?? '', bookId);
+  if (localized) return localized;
+  const canonical = getBookById(bookId);
+  return name || canonical?.englishName || `Book ${bookId}`;
+}
+
 // ---------------------------------------------------------------------------
 // Version coverage — which canonical books/chapters a version actually has
 // ---------------------------------------------------------------------------
@@ -1069,10 +1099,16 @@ export async function getVersionBooksManifest(
     const observed = Math.max(declared, liveMax);
     const chapters = observed > 0 ? observed : canonical?.chaptersCount ?? 0;
     // The bundled asset stores ids only, so its native names come from the
-    // canonical Tamil dictionary; other versions keep their own `name`.
+    // canonical Tamil dictionary; other versions keep their own `name` —
+    // except raw USFM codes (`GEN`, `1SA`), which are replaced with the
+    // localized display name for the version's language.
     const nativeName = bundled
       ? canonical?.tamilName || book.name?.trim() || canonical?.englishName || `Book ${book.id}`
-      : book.name?.trim() || book.commonName?.trim() || canonical?.englishName || `Book ${book.id}`;
+      : resolveBookDisplayName(
+          book.id,
+          book.commonName?.trim() || book.name?.trim(),
+          local.languageCode,
+        );
     manifest.push({
       bookId: book.id,
       nativeName,
@@ -1102,6 +1138,9 @@ function isSkippedHelloaoNode(item: Record<string, unknown>): boolean {
   ) {
     return true;
   }
+  // Bookkeeping nodes (`{ lineBreak: true }`) — layout only. Poetry markers
+  // (`{ text: "...", poem: 1 }`) are NOT skipped: they carry the verse text.
+  if (item.lineBreak === true && typeof item.text !== 'string') return true;
   return false;
 }
 
@@ -1225,7 +1264,7 @@ function normalizePreNormalizedBible(
     languageCode: payload.languageCode ?? '',
     books,
   };
-  local.booksById = buildBooksById(books);
+  local.booksById = buildBooksById(books, local.languageCode);
   return local;
 }
 
@@ -1449,7 +1488,10 @@ function repairStoredLocalBookIds(local: LocalBibleFile): LocalBibleFile {
 }
 
 /** Build the canonical-id-keyed book metadata map for one version. */
-export function buildBooksById(books: LocalBibleBook[]): Record<number, VersionBookMeta> {
+export function buildBooksById(
+  books: LocalBibleBook[],
+  languageCode?: string | null,
+): Record<number, VersionBookMeta> {
   const byId: Record<number, VersionBookMeta> = {};
   for (const book of books) {
     if (!Number.isInteger(book.id) || book.id < 1 || book.id > 66) continue;
@@ -1472,10 +1514,18 @@ export function buildBooksById(books: LocalBibleBook[]): Record<number, VersionB
       : liveChapterCount > 0
         ? liveChapterCount
         : maxChapter;
+    // Raw USFM-code names (`GEN`, `1SA`) are never display titles: resolve
+    // them to the version-language book dictionary name.
+    const resolvedName = resolveBookDisplayName(book.id, book.name, languageCode);
+    const resolvedCommonName = resolveBookDisplayName(
+      book.id,
+      book.commonName?.trim() || book.name,
+      languageCode,
+    );
     byId[book.id] = {
       usfm: book.helloaoBookId?.trim() || getUsfmBookCode(book.id),
-      name: book.name || getBookById(book.id)?.englishName || `Book ${book.id}`,
-      commonName: book.commonName?.trim() || book.name || getBookById(book.id)?.englishName || `Book ${book.id}`,
+      name: resolvedName,
+      commonName: resolvedCommonName,
       numberOfChapters: declaredChapters,
       firstChapterNumber: firstChapter,
     };
@@ -1484,11 +1534,11 @@ export function buildBooksById(books: LocalBibleBook[]): Record<number, VersionB
 }
 
 function bookLookupFromLocalFile(local: LocalBibleFile): Record<number, VersionBookMeta> {
-  return local.booksById ?? buildBooksById(local.books);
+  return local.booksById ?? buildBooksById(local.books, local.languageCode);
 }
 
 function withBooksById(local: LocalBibleFile): LocalBibleFile {
-  if (!local.booksById) local.booksById = buildBooksById(local.books);
+  if (!local.booksById) local.booksById = buildBooksById(local.books, local.languageCode);
   return local;
 }
 
@@ -1516,14 +1566,23 @@ function normalizeHelloaoComplete(
         ? bookData.order
         : index + 1;
     const canonicalId = canonicalBookIdFromUsfm(usfm, fallbackId);
-    const name = typeof bookData.name === 'string' && bookData.name.trim()
-      ? bookData.name
-      : typeof bookData.commonName === 'string' && bookData.commonName.trim()
-        ? bookData.commonName
-        : usfm || `Book ${canonicalId}`;
-    const commonName = typeof bookData.commonName === 'string' && bookData.commonName.trim()
-      ? bookData.commonName.trim()
-      : name;
+    // USFM-code name guard: some payloads ship books without `name`/
+    // `commonName`, leaving the raw `MAT`/`2PE` code as the only label.
+    const languageCode = typeof payload.translation?.language === 'string' ? payload.translation.language : '';
+    const name = resolveBookDisplayName(
+      canonicalId,
+      typeof bookData.name === 'string' && bookData.name.trim()
+        ? bookData.name
+        : typeof bookData.commonName === 'string' && bookData.commonName.trim()
+          ? bookData.commonName
+          : (usfm || `Book ${canonicalId}`),
+      languageCode,
+    );
+    const commonName =
+      typeof bookData.commonName === 'string' && bookData.commonName.trim() &&
+      !isUsfmLikeBookName(bookData.commonName)
+        ? bookData.commonName.trim()
+        : name;
     const chapters: Record<string, ChapterVerse[]> = {};
     for (const rawChapter of bookData.chapters ?? []) {
       const chapter = rawChapter.chapter as { number?: number; content?: unknown } | undefined;
@@ -1552,7 +1611,7 @@ function normalizeHelloaoComplete(
     languageCode: payload.translation?.language || '',
     books,
   };
-  local.booksById = buildBooksById(books);
+  local.booksById = buildBooksById(books, local.languageCode);
   return local;
 }
 
@@ -1662,7 +1721,7 @@ function normalizeGodlytalias(versionId: string, payload: RawGodlytaliasFile): L
     languageCode: bundled ? 'tam' : '',
     books,
   };
-  local.booksById = buildBooksById(books);
+  local.booksById = buildBooksById(books, local.languageCode);
   return local;
 }
 
@@ -1685,24 +1744,48 @@ function parseThiagobodrukVerse(item: unknown, position: number): ChapterVerse |
   return null;
 }
 
-/** Convert a `thiagobodruk` array/66-record payload into the local file shape. */
+/**
+ * Convert a `thiagobodruk` whole-Bible payload into the local file shape.
+ * Two storage variants exist in the mirror:
+ * - classic: a 66-entry array of chapter arrays (each chapter an array of
+ *   verse strings), or a numeric-keyed record of them;
+ * - current: an array of `{ abbrev, chapters: [[text, ...]] }` book records.
+ *
+ * Positional ids follow the canon grids: 27 entries map to the New Testament
+ * (40..66, e.g. `grc_grctr`), 39 entries to the Old Testament (1..39, e.g.
+ * `he_wlc`), everything else to Genesis..Revelation (1..66).
+ */
 function normalizeThiagobodruk(
   versionId: string,
   payload: RawThiagobodrukFile,
 ): LocalBibleFile {
-  const rawBooks: unknown[][] = Array.isArray(payload)
-    ? (payload as unknown[][])
+  const rawBooks: unknown[] = Array.isArray(payload)
+    ? (payload as unknown[])
     : Object.keys(payload as Record<string, unknown[]>)
       .filter((key) => /^\d+$/.test(key))
       .sort((a, b) => Number(a) - Number(b))
       .map((key) => (payload as Record<string, unknown[]>)[key]);
+  const idForIndex = (index: number): number => {
+    if (rawBooks.length === 27) return index + 40;
+    return index + 1;
+  };
   const books: LocalBibleBook[] = [];
   rawBooks.forEach((rawBook, index) => {
     if (index >= 66) return;
-    const id = index + 1;
+    const id = idForIndex(index);
     const chapters: Record<string, ChapterVerse[]> = {};
-    if (Array.isArray(rawBook)) {
-      rawBook.forEach((rawChapter, chapterIndex) => {
+    const record = rawBook && typeof rawBook === 'object'
+      ? rawBook as { chapters?: unknown; Chapter?: unknown }
+      : undefined;
+    const chapterSource = Array.isArray(rawBook)
+      ? rawBook
+      : record && Array.isArray(record.chapters)
+        ? record.chapters
+        : record && Array.isArray(record.Chapter)
+          ? record.Chapter
+          : null;
+    if (chapterSource) {
+      chapterSource.forEach((rawChapter, chapterIndex) => {
         if (!Array.isArray(rawChapter)) return;
         const verses = rawChapter
           .map((item, verseIndex) => parseThiagobodrukVerse(item, verseIndex + 1))
@@ -1714,10 +1797,12 @@ function normalizeThiagobodruk(
       id,
       name: getBookById(id)?.englishName ?? `Book ${id}`,
       helloaoBookId: USFM_BY_BOOK_ID[id],
-      totalChapters: rawBook.length > 0 ? rawBook.length : undefined,
+      totalChapters: chapterSource ? chapterSource.length : undefined,
       chapters,
     });
   });
+  repairPartialLocalBookIds(books);
+  annotateCanonicalBookIds(books);
   const local: LocalBibleFile = {
     versionId,
     versionName: versionId,
@@ -1725,7 +1810,103 @@ function normalizeThiagobodruk(
     languageCode: '',
     books,
   };
-  local.booksById = buildBooksById(books);
+  local.booksById = buildBooksById(books, local.languageCode);
+  return local;
+}
+
+/** One verse inside a `getbible` chapter (`{ chapter, verse, name, text }`). */
+interface RawGetbibleVerse {
+  chapter?: unknown;
+  verse?: unknown;
+  name?: unknown;
+  text?: unknown;
+  [key: string]: unknown;
+}
+
+/** One chapter inside a `getbible` book (`{ chapter, name, verses }`). */
+interface RawGetbibleChapter {
+  chapter?: unknown;
+  name?: unknown;
+  verses?: unknown;
+  [key: string]: unknown;
+}
+
+/**
+ * `getbible` v2 whole-Bible payload (`api.getbible.net/v2/<abbr>.json`):
+ * `{ translation, abbreviation, lang, language, books: [{ nr, name,
+ * chapters: [{ chapter, name, verses: [{ verse, text }] }] }] }`.
+ */
+interface RawGetbibleFile {
+  translation?: unknown;
+  abbreviation?: unknown;
+  lang?: unknown;
+  language?: unknown;
+  books?: unknown;
+  [key: string]: unknown;
+}
+
+/** Convert a `getbible` payload into the local file shape. */
+function normalizeGetbible(versionId: string, payload: RawGetbibleFile): LocalBibleFile {
+  const rawBooks = Array.isArray(payload.books) ? payload.books : [];
+  const books: LocalBibleBook[] = [];
+  rawBooks.forEach((rawBook, index) => {
+    if (!rawBook || typeof rawBook !== 'object') return;
+    const bookRecord = rawBook as Record<string, unknown>;
+    // Names resolve to canonical ids (`Genesis` -> 1, `Song of Solomon` -> 22
+    // via the canonical grid when the exact match misses); `nr` mirrors the
+    // canonical numbering, and NT-only mirrors fall back positionally.
+    const id = resolveCanonicalBookId(bookRecord, index, rawBooks.length);
+    const chapters: Record<string, ChapterVerse[]> = {};
+    if (Array.isArray(bookRecord.chapters)) {
+      (bookRecord.chapters as unknown[]).forEach((rawChapter) => {
+        if (!rawChapter || typeof rawChapter !== 'object') return;
+        const chapter = rawChapter as RawGetbibleChapter;
+        const chapterNumber = typeof chapter.chapter === 'number'
+          ? chapter.chapter
+          : parseInt(String(chapter.chapter ?? ''), 10);
+        if (!Number.isFinite(chapterNumber) || chapterNumber < 1) return;
+        const verses: ChapterVerse[] = [];
+        const verseList = Array.isArray(chapter.verses) ? chapter.verses : [];
+        verseList.forEach((item, verseIndex) => {
+          if (!item || typeof item !== 'object') return;
+          const verse = item as RawGetbibleVerse;
+          if (typeof verse.text !== 'string' || !verse.text.trim()) return;
+          const number = typeof verse.verse === 'number'
+            ? verse.verse
+            : parseInt(String(verse.verse ?? ''), 10);
+          verses.push({
+            verse: Number.isFinite(number) && number > 0 ? number : verseIndex + 1,
+            text: verse.text.replace(/\s+/g, ' ').trim(),
+          });
+        });
+        if (verses.length > 0) chapters[String(chapterNumber)] = verses;
+      });
+    }
+    books.push({
+      id,
+      name: resolveBookDisplayName(
+        id,
+        typeof bookRecord.name === 'string' ? bookRecord.name : undefined,
+      ),
+      helloaoBookId: USFM_BY_BOOK_ID[id],
+      totalChapters: Array.isArray(bookRecord.chapters) ? bookRecord.chapters.length : undefined,
+      chapters,
+    });
+  });
+  repairPartialLocalBookIds(books);
+  annotateCanonicalBookIds(books);
+  const local: LocalBibleFile = {
+    versionId,
+    versionName: typeof payload.translation === 'string' && payload.translation
+      ? payload.translation
+      : typeof payload.abbreviation === 'string' && payload.abbreviation
+        ? payload.abbreviation
+        : versionId,
+    language: typeof payload.language === 'string' ? payload.language : '',
+    languageCode: typeof payload.lang === 'string' ? payload.lang : '',
+    books,
+  };
+  local.booksById = buildBooksById(books, local.languageCode);
   return local;
 }
 
@@ -1759,6 +1940,24 @@ export function normalizeAnyBiblePayload(
         versionId,
         payload as Partial<HelloaoCompleteFile> & Record<string, unknown>,
       );
+    }
+    // `getbible` v2 (api.getbible.net/v2/<abbr>.json): `translation` is a
+    // plain string and each book carries `{ nr, name, chapters }` records
+    // with `{ chapter, verses }` children — a shape the godlytalias chapter
+    // parser would silently drop every verse of.
+    if (typeof record.translation === 'string' && record.books.length > 10) {
+      const sampleBook = record.books.find(
+        (entry) => entry && typeof entry === 'object',
+      ) as Record<string, unknown> | undefined;
+      const hasGetbibleChapters = sampleBook
+        ? Array.isArray(sampleBook.chapters) &&
+          sampleBook.chapters.some(
+            (node) => node && typeof node === 'object' && !Array.isArray(node),
+          )
+        : false;
+      if (sampleBook && ('nr' in sampleBook || hasGetbibleChapters)) {
+        return normalizeGetbible(versionId, payload as RawGetbibleFile);
+      }
     }
     if (firstBook && typeof firstBook === 'object' && 'chapters' in firstBook) {
       const wrapper = record as { books: unknown[]; versionName?: string; language?: string; languageCode?: string };
@@ -1830,58 +2029,91 @@ export async function downloadBibleVersion(
   }
 
   const rawTranslationId = version.helloaoTranslationId || version.id;
-  const url = version.source === 'json'
+
+  // Task 7 — multi-source fallback chain: the helloao (or curated JSON)
+  // endpoint first, then getbible / thiagobodruk / godlytalias mirrors
+  // registered for this version. Every payload shape is handled by
+  // `normalizeAnyBiblePayload`.
+  const primaryUrl = version.source === 'json'
     ? version.downloadUrl
     : helloaoVersionUrl(rawTranslationId);
+  const candidateUrls: string[] = [];
+  if (primaryUrl) candidateUrls.push(primaryUrl);
+  for (const url of fallbackJsonEndpoints(version.id, version.helloaoTranslationId ?? rawTranslationId)) {
+    if (!candidateUrls.includes(url)) candidateUrls.push(url);
+  }
 
   await ensureBiblesDirectory();
   const tempPath = `${biblesDirectoryPath()}${safeFileStem(version.id)}.partial.json`;
 
   let localFile: LocalBibleFile | null = null;
+  let sawHttpResponse = false;
 
-  if (url) {
+  type FileSystemDownloadProgress = {
+    totalBytesWritten: number;
+    totalBytesExpectedToWrite: number;
+  };
+  const onDownloadProgress = (progressEvent: FileSystemDownloadProgress): void => {
+    const { totalBytesWritten, totalBytesExpectedToWrite } = progressEvent;
+    const percent = totalBytesWritten / Math.max(1, totalBytesExpectedToWrite);
+    onProgress?.({
+      versionId: version.id,
+      percent: percent >= 1 ? 95 : Math.floor(percent * 95),
+      bytesWritten: totalBytesWritten,
+      totalBytes: totalBytesExpectedToWrite,
+    });
+  };
+
+  for (const [urlIndex, url] of candidateUrls.entries()) {
+    if (candidateUrls.length > 1) {
+      onProgress?.({
+        versionId: version.id,
+        percent: Math.min(35, 5 + urlIndex * 10),
+        bytesWritten: 0,
+        totalBytes: 0,
+      });
+    }
     try {
-      type FileSystemDownloadProgress = {
-        totalBytesWritten: number;
-        totalBytesExpectedToWrite: number;
-      };
-      const onDownloadProgress = (progressEvent: FileSystemDownloadProgress): void => {
-        const { totalBytesWritten, totalBytesExpectedToWrite } = progressEvent;
-        const percent = totalBytesWritten / Math.max(1, totalBytesExpectedToWrite);
-        onProgress?.({
-          versionId: version.id,
-          percent: percent >= 1 ? 95 : Math.floor(percent * 95),
-          bytesWritten: totalBytesWritten,
-          totalBytes: totalBytesExpectedToWrite,
-        });
-      };
       const resumable = FileSystem.createDownloadResumable(url, tempPath, {}, onDownloadProgress);
       const res = await resumable.downloadAsync();
+      sawHttpResponse = sawHttpResponse || (res !== undefined && res !== null);
       if (res && res.status >= 200 && res.status < 300) {
         const raw = await FileSystem.readAsStringAsync(tempPath, {
           encoding: FileSystem.EncodingType.UTF8,
         });
         const parsed: unknown = JSON.parse(raw);
-        localFile = normalizeAnyBiblePayload(version.id, parsed);
+        const normalized = normalizeAnyBiblePayload(version.id, parsed);
+        if (normalized && normalized.books.length > 0) {
+          localFile = normalized;
+          break;
+        }
       }
     } catch {
-      // complete.simple.json not available or failed; fallback to on-demand skeleton
+      // Source unavailable or unparsable; the next candidate (then the
+      // on-demand skeleton below) takes over.
     } finally {
       await FileSystem.deleteAsync(tempPath, { idempotent: true });
     }
   }
 
-  // If complete.simple.json wasn't available or couldn't be parsed, create a skeleton Bible file from books.json
+  // If no source produced a parseable full-Bible payload, create a skeleton
+  // Bible file from the helloao `books.json` grid (helloao-backed versions
+  // only) so partial installs keep their on-demand chapter fetching.
   if (!localFile || !localFile.books.length) {
     onProgress?.({ versionId: version.id, percent: 50, bytesWritten: 0, totalBytes: 0 });
+    const skeletonTranslationId = version.source === 'json'
+      ? version.helloaoTranslationId ?? null
+      : rawTranslationId;
     let booksPayload: any = null;
-    try {
-      const resp = await fetch(`https://bible.helloao.org/api/${rawTranslationId}/books.json`);
-      if (resp.ok) {
-        booksPayload = await resp.json();
+    if (skeletonTranslationId) {
+      try {
+        const resp = await fetch(`https://bible.helloao.org/api/${skeletonTranslationId}/books.json`);
+        if (resp.ok) {
+          booksPayload = await resp.json();
+        }
+      } catch {
+        // network error
       }
-    } catch {
-      // network error
     }
 
     const isOtOnly = /heb|mas/i.test(version.id) || /hebrew/i.test(version.languageName);
@@ -1901,7 +2133,12 @@ export async function downloadBibleVersion(
           );
           skeletonBooks.push({
             id: bookId,
-            name: b.name || b.commonName || usfm,
+            // USFM-code name guard — `2PE` style labels become localized names.
+            name: resolveBookDisplayName(
+              bookId,
+              typeof b.name === 'string' && b.name ? b.name : (b.commonName || usfm),
+              booksPayload?.translation?.language || version.languageCode,
+            ),
             helloaoBookId: usfm,
             totalChapters:
               Number.isFinite(declaredChapters) && declaredChapters > 0
@@ -1918,12 +2155,25 @@ export async function downloadBibleVersion(
         const usfm = getUsfmBookCode(i);
         skeletonBooks.push({
           id: i,
-          name: usfm,
+          name: resolveBookDisplayName(i, usfm, version.languageCode),
           helloaoBookId: usfm,
           totalChapters: getBookById(i)?.chaptersCount,
           chapters: {},
         });
       }
+    }
+
+    // Dead source + no helloao on-demand grid ⇒ nothing can ever be read:
+    // blacklist the id so lists stop offering it and let the caller show the
+    // download failure.
+    const hasData = skeletonBooks.some((book) => Object.keys(book.chapters).length > 0);
+    if (!skeletonTranslationId && !hasData) {
+      if (sawHttpResponse) {
+        void markVersionFailed(version.id);
+      }
+      throw new Error(
+        `Could not download “${version.name}” — every mirror for this translation is unreachable.`,
+      );
     }
 
     localFile = {
@@ -1942,6 +2192,9 @@ export async function downloadBibleVersion(
 
   // Warm the parsed-Bible memory cache and register in device registry
   parsedBiblesCache.set(normalizeVersionId(version.id), localFile);
+  // A successful install un-blacklists the id (it may only have failed once —
+  // e.g. a transient mirror glitch recorded by a probe).
+  void clearFailedVersion(version.id);
   // Invalidate derived caches: a re-download can change ids/names/chapters,
   // and a missing version cached `[]` before this install.
   customBookNamesCache.delete(normalizeVersionId(version.id));

@@ -526,6 +526,13 @@ export default function ProgressScreen() {
 
   const openBookNames = openBook ? localizedBook(openBook.id) : null;
 
+  /**
+   * Version code shown in the top-right pill. Rendered as its own <Text>
+   * next to a separate ▾ chevron <Text>, so 4-letter codes (TOJB / NEB)
+   * can never squeeze the dropdown arrow out of the pill.
+   */
+  const progressVersionShortName = progressMeta?.shortName || '—';
+
   return (
     <View style={[styles.screen, { backgroundColor: theme.background }]}>
       <AppHeader
@@ -535,11 +542,12 @@ export default function ProgressScreen() {
             style={styles.versionBadge}
             onPress={() => setVersionPickerOpen(true)}
             accessibilityRole="button"
-            accessibilityLabel={`Progress version ${progressMeta?.shortName ?? ''}. Change version`}
+            accessibilityLabel={`Progress version ${progressVersionShortName}. Change version`}
           >
-            <Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.8} style={styles.versionBadgeText}>
-              {progressMeta?.shortName || '—'} ▾
+            <Text numberOfLines={1} style={styles.versionBadgeText}>
+              {progressVersionShortName}
             </Text>
+            <Text style={styles.versionBadgeChevron}>▾</Text>
           </ScalePressable>
         }
       />
@@ -589,7 +597,7 @@ export default function ProgressScreen() {
               accessibilityRole="button"
               accessibilityLabel="Download a version to track"
             >
-              <Text style={styles.addVersionPillText}>+ Download Version</Text>
+              <Text numberOfLines={1} style={styles.addVersionPillText}>+ Download Versions</Text>
             </ScalePressable>
           </ScrollView>
         </View>
@@ -696,7 +704,13 @@ export default function ProgressScreen() {
             <View
               style={[
                 styles.modalHeader,
-                { paddingTop: topModalInset + 10, paddingBottom: 12 },
+                {
+                  // The full-screen <Modal> is not statusBarTranslucent, so
+                  // Android already places it below the status bar — pad a
+                  // small 12px instead of the status-bar band (dead space).
+                  paddingTop: Platform.OS === 'android' ? 12 : insets.top + 8,
+                  paddingBottom: 12,
+                },
               ]}
             >
               {/* Left — round 40x40 ✕ Close button */}
@@ -855,17 +869,27 @@ function makeStyles(theme: AppTheme) {
   return StyleSheet.create({
     screen: { flex: 1 },
     versionBadge: {
-      flexShrink: 1,
-      maxWidth: 180,
-      borderRadius: 999,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingHorizontal: 12,
+      height: 38,
+      minWidth: 78,
+      borderRadius: 19,
+      gap: 5,
+      flexShrink: 0,
       borderWidth: 1,
       borderColor: theme.primary,
-      paddingHorizontal: 10,
-      paddingVertical: 6,
-      minHeight: 38,
-      justifyContent: 'center',
+      backgroundColor: theme.surface,
     },
-    versionBadgeText: { color: theme.primary, fontSize: 13, fontWeight: '700', lineHeight: 22 },    content: {
+    versionBadgeText: { color: theme.primary, fontSize: 13.5, fontWeight: '800' },
+    versionBadgeChevron: {
+      color: theme.primary,
+      fontSize: 12,
+      fontWeight: '900',
+      flexShrink: 0,
+      includeFontPadding: false,
+    },    content: {
       paddingTop: 16,
       paddingBottom: 40,
       gap: 14,
@@ -919,7 +943,10 @@ function makeStyles(theme: AppTheme) {
     },
     versionPillNameActive: { color: theme.primary },
     addVersionPill: {
-      minWidth: 150,
+      paddingHorizontal: 16,
+      minWidth: 156,
+      height: 60,
+      flexShrink: 0,
       alignItems: 'center',
       justifyContent: 'center',
       borderColor: theme.primary,
@@ -927,9 +954,9 @@ function makeStyles(theme: AppTheme) {
     },
     addVersionPillText: {
       color: theme.primary,
-      fontSize: 13,
-      fontWeight: '700',
-      lineHeight: 22,
+      fontSize: 13.5,
+      fontWeight: '800',
+      flexShrink: 0,
     },
     // Summary card
     summaryCard: {
@@ -1055,9 +1082,9 @@ function makeStyles(theme: AppTheme) {
       backgroundColor: theme.surface,
     },
     modalIconButton: {
-      width: 40,
-      height: 40,
-      borderRadius: 20,
+      width: 38,
+      height: 38,
+      borderRadius: 19,
       backgroundColor: theme.surface,
       borderWidth: 1,
       borderColor: theme.border,
@@ -1086,7 +1113,7 @@ function makeStyles(theme: AppTheme) {
       marginTop: 2,
     },
     modalHeaderPill: {
-      minWidth: 64,
+      minWidth: 78,
       height: 36,
       paddingHorizontal: 12,
       borderRadius: 18,

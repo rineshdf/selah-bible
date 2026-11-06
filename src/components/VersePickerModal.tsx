@@ -20,7 +20,6 @@ import {
   Platform,
   Pressable,
   ScrollView,
-  StatusBar,
   StyleSheet,
   Text,
   TextInput,
@@ -48,9 +47,10 @@ import {
   type DownloadedVersionSummary,
   type VersionBookManifestEntry,
 } from '@/db/bibleLoader';
-import { DEFAULT_VERSIONS, filterVersions, searchOnlineTranslations, type DownloadableVersion } from '@/constants/versionCatalog';
+import { DEFAULT_VERSIONS, dropFailingVersions, filterVersions, searchOnlineTranslations, type DownloadableVersion } from '@/constants/versionCatalog';
 import { PlusVerseSvg } from '@/components/SvgIcons';
 import { ScalePressable } from '@/components/ScalePressable';
+import { isRtlVersionMeta } from '@/constants/books';
 import type { AppTheme } from '@/constants/colors';
 
 export interface VersePickResult {
@@ -65,6 +65,8 @@ export interface VersePickResult {
   verse: string;
   /** Scripture text of the selected verse or range. */
   text: string;
+  /** Structured per-verse payload in ascending verse order. */
+  verses: { verse: number; text: string }[];
   /** Optional quick sub-note typed in step 4. */
   note: string;
 }
@@ -75,7 +77,7 @@ export interface VersePickerModalProps {
   onClose: () => void;
 }
 
-const MAX_RANGE_SPAN = 10;
+type Stage = 'version' | 'books' | 'chapters' | 'verses';
 
 /**
  * Combine picked verse numbers into a compact display label:
@@ -100,8 +102,6 @@ function combineVerseNumbers(selected: Set<number>): string {
   groups.push(runStart === prev ? String(runStart) : `${runStart}-${prev}`);
   return groups.join(', ');
 }
-
-type Stage = 'version' | 'books' | 'chapters' | 'verses';
 
 /** FIX 4 — one book row: canonical book object + the version's manifest entry. */
 type PickerBookRow = {
@@ -142,18 +142,6 @@ function VersePickerBody({
   const tileWidth = Math.floor(
     (screenWidth - gridPadding * 2 - gridGap * (gridCols - 1)) / gridCols,
   );
-  /**
-   * Guaranteed top inset for the full-screen <Modal> header. Android
-   * edge-to-edge renders modal windows behind the status bar and camera
-   * cutout, so `insets.top` alone is not enough: take the platform status bar
-   * height too and enforce a 36px floor so the ‹ Back, stage title, and ✕
-   * Close always sit safely below the clock, center cutout, and battery icon.
-   */
-  const topModalInset = Math.max(
-    insets.top,
-    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 36) : 0,
-    36,
-  );
 
   const [stage, setStage] = useState<Stage>('version');
   const [versions, setVersions] = useState<DownloadedVersionSummary[]>([]);
@@ -175,8 +163,6 @@ function VersePickerBody({
   const [note, setNote] = useState('');
 
   const loadTokenRef = useRef(0);
-  /** Last tapped verse number, used to grab a contiguous ±10 range in one tap. */
-  const lastTappedRef = useRef<number | null>(null);
   /**
    * FIX 4 — the picked version's EXACT book manifest (`null` while loading):
    * only books the version actually carries, with its own native names and
@@ -292,9 +278,13 @@ function VersePickerBody({
     if (query.length < 2) return;
     let cancelled = false;
     searchOnlineTranslations(query)
-      .then((online) => {
+      .then(async (online) => {
+        // Health probe before render: dead helloao ids are health-checked in
+        // order, auto-recorded in `@selah_invalid_versions`, and dropped so
+        // broken translations never reach the result list.
+        const verified = await dropFailingVersions(online);
         if (cancelled) return;
-        const combined = [...DEFAULT_VERSIONS, ...online];
+        const combined = [...DEFAULT_VERSIONS, ...verified];
         const unique = new Map(combined.map((version) => [version.id, version]));
         setSearchResults([...unique.values()]);
         setSearchCompletedQuery(query);
@@ -380,7 +370,6 @@ function VersePickerBody({
     setVerseError(null);
     setVerses([]);
     setSelectedVerses(new Set());
-    lastTappedRef.current = null;
     try {
       // Partial versions redirect an unavailable book/chapter to the first one
       // the version actually carries — sync the picker state to what was served.
@@ -459,34 +448,14 @@ function VersePickerBody({
   );
 
   /**
-   * Multi-select: tap toggles one verse in and out. Tap a verse within ±10 of
-   * the last tap while it is unpicked and the whole contiguous range is added.
+   * Multi-select: tap toggles one verse in or out — any combination without
+   * range grabbing.
    */
   const toggleVerseSelection = useCallback((verse: number) => {
-    const anchor = lastTappedRef.current;
-    lastTappedRef.current = verse;
     setSelectedVerses((current) => {
       const next = new Set(current);
       if (next.has(verse)) {
         next.delete(verse);
-        return next;
-      }
-      const span = anchor === null ? 0 : Math.abs(verse - anchor);
-      if (span <= MAX_RANGE_SPAN && span > 0) {
-        const lo = Math.min(anchor ?? verse, verse);
-        const hi = Math.max(anchor ?? verse, verse);
-        let alreadyCovered = true;
-        for (let v = lo; v <= hi; v += 1) {
-          if (!current.has(v)) {
-            alreadyCovered = false;
-            break;
-          }
-        }
-        if (alreadyCovered) {
-          next.add(verse);
-        } else {
-          for (let v = lo; v <= hi; v += 1) next.add(v);
-        }
       } else {
         next.add(verse);
       }
@@ -496,13 +465,21 @@ function VersePickerBody({
 
   const verseLabel = useMemo(() => combineVerseNumbers(selectedVerses), [selectedVerses]);
 
-  const previewText = useMemo(() => {
-    if (selectedVerses.size === 0) return '';
-    return verses
-      .filter((item) => selectedVerses.has(item.verse))
-      .map((item) => item.text)
-      .join(' ');
-  }, [selectedVerses, verses]);
+  /** Hebrew codices (WLC / Aleppo / Modern) read Right-to-Left automatically. */
+  const pickedVersionIsRtl = useMemo(
+    () => isRtlVersionMeta(selectedVersion),
+    [selectedVersion],
+  );
+
+  const previewVerses = useMemo(
+    () =>
+      verses
+        .filter((item) => selectedVerses.has(item.verse))
+        .map((item) => ({ verse: item.verse, text: item.text })),
+    [selectedVerses, verses],
+  );
+
+  const previewText = useMemo(() => previewVerses.map((item) => item.text).join(' '), [previewVerses]);
 
   const insertVerse = useCallback(() => {
     if (!selectedVersion || !selectedBook || selectedVerses.size === 0) return;
@@ -515,12 +492,14 @@ function VersePickerBody({
       chapter: selectedChapter,
       verse: verseLabel,
       text: previewText,
+      verses: previewVerses,
       note: note.trim(),
     });
   }, [
     note,
     onInsert,
     previewText,
+    previewVerses,
     selectedBook,
     selectedChapter,
     selectedVerses.size,
@@ -529,10 +508,10 @@ function VersePickerBody({
   ]);
 
   const stageLabels: Record<Stage, string> = {
-    version: 'Step 1 · Choose Version',
-    books: 'Step 2 · Choose Book',
-    chapters: selectedBook ? `Step 3 · ${selectedBook.englishName} Chapters` : 'Step 3 · Chapters',
-    verses: selectedBook ? `Step 4 · ${selectedBook.englishName} ${selectedChapter}` : 'Step 4 · Verses',
+    version: 'Step 1 • Choose Version',
+    books: 'Step 2 • Choose Book',
+    chapters: selectedBook ? `Step 3 • ${selectedBook.englishName} Chapters` : 'Step 3 • Chapters',
+    verses: selectedBook ? `Step 4 • ${selectedBook.englishName} ${selectedChapter}` : 'Step 4 • Verses',
   };
 
   const backTargets: Record<Stage, Stage | null> = {
@@ -544,70 +523,83 @@ function VersePickerBody({
 
   return (
     <View style={[styles.screen, { backgroundColor: theme.background }]}>
-      {/* Header: back + stage label + close (sits safely below the status bar) */}
+      {/* Header — 3-column layout so the title is 100% geometrically centered:
+          LEFT (minWidth 80, flex-start): the ✕ close (root step) or the ‹ Back
+          pill (sub-steps) with a `numberOfLines={1}` label that can NEVER wrap
+          ("< Bac" / "k"); CENTER: the stage title; RIGHT: an invisible 80px
+          spacer that optically balances the left column. */}
       <View
         style={[
           styles.header,
-          { paddingTop: topModalInset + 10, paddingBottom: 12 },
+          {
+            // The <Modal> is NOT statusBarTranslucent → Android already
+            // positions it below the status bar. Padding past the status bar
+            // again would paint a dead dark band above the header.
+            paddingTop: Platform.OS === 'android' ? 12 : insets.top + 8,
+            paddingBottom: 12,
+          },
         ]}
       >
-        {backTargets[stage] && selectedVersion ? (
-          <Pressable
-            onPress={() => {
-              const target = backTargets[stage];
-              if (stage === 'verses') {
-                setVerses([]);
-                setSelectedVerses(new Set());
-                lastTappedRef.current = null;
-              }
-              if (target) setStage(target);
-            }}
-            accessibilityRole="button"
-            accessibilityLabel="Go back one step"
-          >
-            <Text style={styles.backText}>‹ Back</Text>
-          </Pressable>
-        ) : (
-          <View style={styles.headerSpacer} />
-        )}
+        {/* LEFT column — close or back, never narrower than 80px */}
+        <View style={styles.headerSide}>
+          {stage === 'version' ? (
+            <Pressable
+              style={styles.headerIconButton}
+              onPress={onClose}
+              accessibilityRole="button"
+              accessibilityLabel="Close verse picker"
+            >
+              <Text style={styles.closeText}>✕</Text>
+            </Pressable>
+          ) : (
+            <Pressable
+              style={styles.headerBackPill}
+              onPress={() => {
+                const target = backTargets[stage];
+                if (stage === 'verses') {
+                  setVerses([]);
+                  setSelectedVerses(new Set());
+                }
+                if (target) setStage(target);
+              }}
+              accessibilityRole="button"
+              accessibilityLabel="Go back one step"
+            >
+              <Text numberOfLines={1} style={styles.backText}>‹ Back</Text>
+            </Pressable>
+          )}
+        </View>
+        {/* CENTER column — title */}
         <Text numberOfLines={1} style={styles.stageTitle}>{stageLabels[stage]}</Text>
-        <Pressable
-          onPress={onClose}
-          accessibilityRole="button"
-          accessibilityLabel="Close verse picker"
-        >
-          <Text style={styles.closeText}>✕</Text>
-        </Pressable>
+        {/* RIGHT column — invisible balance spacer */}
+        <View style={styles.headerSide} />
       </View>
 
       {/* Step 1 — version chooser */}
       {stage === 'version' ? (
         <>
           <View style={styles.searchBar}>
-            <View style={styles.searchInputRow}>
-              <TextInput
-                style={styles.searchInput}
-                placeholder="Search Bible versions…"
-                placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
-                value={versionQuery}
-                onChangeText={setVersionQuery}
-                autoCorrect={false}
-                autoCapitalize="none"
-              />
-              {versionQuery.length > 0 ? (
-                <Pressable
-                  style={styles.searchClearBtn}
-                  onPress={() => setVersionQuery('')}
-                  accessibilityRole="button"
-                  accessibilityLabel="Clear version search"
-                >
-                  <Text style={styles.searchClearText}>✕</Text>
-                </Pressable>
-              ) : null}
-            </View>
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search Bible versions…"
+              placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
+              value={versionQuery}
+              onChangeText={setVersionQuery}
+              autoCorrect={false}
+              autoCapitalize="none"
+            />
+            {versionQuery.length > 0 ? (
+              <Pressable
+                style={styles.searchClearBtn}
+                onPress={() => setVersionQuery('')}
+                accessibilityRole="button"
+                accessibilityLabel="Clear version search"
+              >
+                <Text style={styles.searchClearText}>✕</Text>
+              </Pressable>
+            ) : null}
           </View>
           <View style={styles.versionSearchStatus}>
-            <Text style={styles.versionListLabel}>On This Device</Text>
             {versionSearchBusy ? <ActivityIndicator size="small" color={theme.primary} /> : null}
           </View>
           {versionSearchError ? <Text style={styles.searchError}>{versionSearchError}</Text> : null}
@@ -628,39 +620,45 @@ function VersePickerBody({
                   <View style={{ flex: 1, gap: 2 }}>
                     <Text numberOfLines={1} style={styles.versionName}>{summary.versionName}</Text>
                     <Text numberOfLines={1} style={styles.versionSub}>
-                      {summary.languageName || '—'} · On this device{active ? ' · Active' : ''}
+                      {summary.languageName || '—'}{active ? ' · Active' : ''}
                     </Text>
                   </View>
                   {active ? <Text style={styles.activeTag}>Active ✓</Text> : null}
                 </Pressable>
               );
             })}
-            <Text style={styles.versionListLabel}>Available Bibles</Text>
-            {filteredAvailableVersions.map((summary) => {
-              const progress = downloadProgress[summary.id];
-              return (
-                <Pressable
-                  key={summary.id}
-                  style={styles.versionRow}
-                  onPress={() => chooseVersion(summary)}
-                  disabled={downloadingId !== null}
-                  accessibilityRole="button"
-                  accessibilityLabel={`Download ${summary.versionName}`}
-                >
-                  <View style={{ flex: 1, gap: 2 }}>
-                    <Text numberOfLines={1} style={styles.versionName}>{summary.versionName}</Text>
-                    <Text numberOfLines={1} style={styles.versionSub}>{summary.languageName} · {summary.shortName}</Text>
-                    {progress !== undefined ? (
-                      <View style={styles.downloadProgressTrack}>
-                        <View style={[styles.downloadProgressFill, { width: `${progress}%` }]} />
+            {/* Available Bibles appear only while actively searching. */}
+            {versionQuery.trim().length > 0 ? (
+              <>
+                <Text style={styles.versionListLabel}>Available Bibles</Text>
+                {filteredAvailableVersions.map((summary) => {
+                  const progress = downloadProgress[summary.id];
+                  return (
+                    <Pressable
+                      key={summary.id}
+                      style={styles.versionRow}
+                      onPress={() => chooseVersion(summary)}
+                      disabled={downloadingId !== null}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Download ${summary.versionName}`}
+                    >
+                      <View style={{ flex: 1, gap: 2 }}>
+                        <Text numberOfLines={1} style={styles.versionName}>{summary.versionName}</Text>
+                        <Text numberOfLines={1} style={styles.versionSub}>{summary.languageName} · {summary.shortName}</Text>
+                        {progress !== undefined ? (
+                          <View style={styles.downloadProgressTrack}>
+                            <View style={[styles.downloadProgressFill, { width: `${progress}%` }]} />
+                          </View>
+                        ) : null}
                       </View>
-                    ) : null}
-                  </View>
-                  {downloadingId === summary.id ? <ActivityIndicator size="small" color={theme.primary} /> : <Text style={styles.activeTag}>Download</Text>}
-                </Pressable>
-              );
-            })}
-            {filteredInstalledVersions.length === 0 && filteredAvailableVersions.length === 0 ? (
+                      {downloadingId === summary.id ? <ActivityIndicator size="small" color={theme.primary} /> : <Text style={styles.activeTag}>Download</Text>}
+                    </Pressable>
+                  );
+                })}
+              </>
+            ) : null}
+            {filteredInstalledVersions.length === 0 &&
+            (versionQuery.trim().length === 0 || filteredAvailableVersions.length === 0) ? (
               <Text style={styles.emptyText}>No Bible versions found.</Text>
             ) : null}
           </ScrollView>
@@ -671,26 +669,24 @@ function VersePickerBody({
       {stage === 'books' ? (
         <>
           <View style={styles.searchBar}>
-            <View style={styles.searchInputRow}>
-              <TextInput
-                style={styles.searchInput}
-                placeholder="Search book…"
-                placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
-                value={bookQuery}
-                onChangeText={setBookQuery}
-                autoCorrect={false}
-              />
-              {bookQuery.length > 0 ? (
-                <Pressable
-                  style={styles.searchClearBtn}
-                  onPress={() => setBookQuery('')}
-                  accessibilityRole="button"
-                  accessibilityLabel="Clear book search"
-                >
-                  <Text style={styles.searchClearText}>✕</Text>
-                </Pressable>
-              ) : null}
-            </View>
+            <TextInput
+              style={styles.searchInput}
+              placeholder="Search books…"
+              placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
+              value={bookQuery}
+              onChangeText={setBookQuery}
+              autoCorrect={false}
+            />
+            {bookQuery.length > 0 ? (
+              <Pressable
+                style={styles.searchClearBtn}
+                onPress={() => setBookQuery('')}
+                accessibilityRole="button"
+                accessibilityLabel="Clear book search"
+              >
+                <Text style={styles.searchClearText}>✕</Text>
+              </Pressable>
+            ) : null}
           </View>
           <ScrollView contentContainerStyle={styles.listContent}>
             {([
@@ -758,10 +754,15 @@ function VersePickerBody({
       {/* Step 4 — verse selection with preview + note + insert */}
       {stage === 'verses' && selectedBook ? (
         <>
-          <Text numberOfLines={1} style={styles.stepHint}>
-            {`${selectedVersion?.shortName ?? ''} · ${localizedBook(selectedBook.id).primaryName} ${selectedChapter}`}
-          </Text>
-          <ScrollView contentContainerStyle={styles.listContent}>
+          <View style={styles.verseSubHeader}>
+            <Text numberOfLines={1} style={styles.verseSubHeaderTitle}>
+              {`${selectedVersion?.versionName ?? selectedVersion?.shortName ?? ''} • ${localizedBook(selectedBook.id).primaryName} ${selectedChapter}`}
+            </Text>
+            <Text numberOfLines={1} style={styles.verseSubHeaderCount}>
+              {selectedVerses.size > 0 ? `${selectedVerses.size} selected` : 'Tap verses to select'}
+            </Text>
+          </View>
+          <ScrollView contentContainerStyle={[styles.listContent, styles.versesListContent]}>
             {loadingVerses ? (
               <ActivityIndicator style={styles.spinner} size="large" color={theme.primary} />
             ) : verseError ? (
@@ -781,7 +782,9 @@ function VersePickerBody({
                         accessibilityRole="button"
                         accessibilityLabel={`Select verse ${item.verse}`}
                       >
-                        <Text style={styles.verseText}>
+                        <Text
+                          style={[styles.verseText, pickedVersionIsRtl ? styles.verseTextRtl : null]}
+                        >
                           <Text style={styles.verseNumber}>{item.verse} </Text>
                           {item.text}
                         </Text>
@@ -797,7 +800,14 @@ function VersePickerBody({
                         {`${localizedBook(selectedBook.id).primaryName} ${selectedChapter}:${verseLabel}`}
                       </Text>
                     </View>
-                    <Text style={styles.previewText}>{previewText}</Text>
+                    <Text
+                      style={[
+                        styles.previewText,
+                        pickedVersionIsRtl ? styles.previewTextRtl : null,
+                      ]}
+                    >
+                      {previewText}
+                    </Text>
                     <TextInput
                       style={styles.noteInput}
                       placeholder="Quick sub-note (optional)…"
@@ -809,7 +819,7 @@ function VersePickerBody({
                   </View>
                 ) : (
                   <Text style={styles.hint}>
-                    Tap verses to select any combination — tap a nearby verse (±{MAX_RANGE_SPAN}) to grab the whole range.
+                    Tap verses to select any combination.
                   </Text>
                 )}
               </>
@@ -846,42 +856,75 @@ function makeStyles(theme: AppTheme) {
     header: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 12,
       paddingHorizontal: 16,
       borderBottomWidth: 1,
       borderBottomColor: theme.border,
       backgroundColor: theme.surface,
     },
-    headerSpacer: { width: 44 },
-    backText: { color: theme.primary, fontSize: 14, fontWeight: '600', width: 44 },
+    // LEFT/RIGHT columns: 80px min keeps a truly centered title while giving
+    // the ‹ Back pill all the width it needs without wrapping.
+    headerSide: {
+      minWidth: 80,
+      alignItems: 'flex-start',
+      justifyContent: 'center',
+    },
+    headerIconButton: {
+      width: 38,
+      height: 38,
+      borderRadius: 19,
+      borderWidth: 1,
+      borderColor: theme.border,
+      backgroundColor: theme.surface,
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    headerBackPill: {
+      height: 36,
+      borderRadius: 18,
+      paddingHorizontal: 12,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
+      flexShrink: 0,
+    },
+    backText: {
+      color: theme.primary,
+      fontSize: 14,
+      fontWeight: '700',
+      flexShrink: 0,
+    },
     stageTitle: {
       flex: 1,
       color: theme.text,
       fontSize: 16,
       fontWeight: '700',
       textAlign: 'center',
+      paddingHorizontal: 4,
     },
-    closeText: { color: theme.textMuted, fontSize: 17, fontWeight: '700', width: 20 },
+    closeText: { color: theme.textMuted, fontSize: 17, fontWeight: '700', lineHeight: 20 },
     searchBar: {
-      paddingHorizontal: 14,
-      paddingVertical: 8,
-    },
-    searchInputRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      minHeight: 40,
+      marginHorizontal: 14,
+      marginTop: 8,
+      marginBottom: 6,
+      height: 42,
+      borderRadius: 12,
       borderWidth: 1,
       borderColor: theme.isDark ? '#334155' : '#CBD5E1',
       backgroundColor: theme.isDark ? '#1E293B' : '#F1F5F9',
-      borderRadius: 10,
-      paddingHorizontal: 8,
+      flexDirection: 'row',
+      alignItems: 'center',
+      paddingHorizontal: 14,
     },
     searchInput: {
       flex: 1,
-      minHeight: 40,
+      height: 44,
       color: theme.isDark ? '#F8FAFC' : '#0F172A',
-      paddingHorizontal: 6,
       fontSize: 14,
+      textAlign: 'center',
     },
     searchClearBtn: {
       padding: 6,
@@ -895,8 +938,11 @@ function makeStyles(theme: AppTheme) {
     },
     listContent: {
       paddingHorizontal: 16,
-      paddingBottom: 40,
+      paddingTop: 2,
+      paddingBottom: 28,
     },
+    // Keep the first verse row from crowding the subheader divider.
+    versesListContent: { paddingTop: 10 },
     versionSearchStatus: {
       flexDirection: 'row',
       alignItems: 'center',
@@ -908,8 +954,9 @@ function makeStyles(theme: AppTheme) {
       color: theme.textMuted,
       fontSize: 13,
       fontWeight: '800',
-      marginTop: 10,
-      marginBottom: 2,
+      marginTop: 6,
+      paddingTop: 10,
+      paddingBottom: 6,
     },
     searchError: { color: '#DC2626', fontSize: 13, paddingHorizontal: 16, paddingTop: 6 },
     downloadProgressTrack: {
@@ -924,8 +971,8 @@ function makeStyles(theme: AppTheme) {
       color: theme.textMuted,
       fontSize: 12,
       fontWeight: '700',
-      marginTop: 12,
-      marginBottom: 4,
+      marginTop: 4,
+      marginBottom: 6,
     },
     versionRow: {
       flexDirection: 'row',
@@ -986,6 +1033,10 @@ function makeStyles(theme: AppTheme) {
     },
     verseRowPicked: { backgroundColor: theme.surfaceMuted },
     verseText: { color: theme.text, fontSize: 15, lineHeight: 23 },
+    verseTextRtl: {
+      textAlign: 'right',
+      writingDirection: 'rtl',
+    },
     verseNumber: { color: theme.textMuted, fontSize: 13, fontWeight: '700' },
     previewCard: {
       marginTop: 12,
@@ -999,6 +1050,7 @@ function makeStyles(theme: AppTheme) {
     previewHeader: { flexDirection: 'row', alignItems: 'center', gap: 6 },
     previewRef: { flex: 1, color: theme.primary, fontSize: 13, fontWeight: '700' },
     previewText: { color: theme.text, fontSize: 14, lineHeight: 22 },
+    previewTextRtl: { textAlign: 'right', writingDirection: 'rtl' },
     noteInput: {
       minHeight: 40,
       borderRadius: 8,
@@ -1011,12 +1063,30 @@ function makeStyles(theme: AppTheme) {
       fontSize: 13,
     },
     hint: { color: theme.textMuted, fontSize: 13, marginTop: 12 },
-    stepHint: {
+    // Step 4 subheader — version • book • chapter on the left, live selection
+    // count on the right ("N selected" / "Tap verses to select").
+    verseSubHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: 16,
+      paddingVertical: 10,
+      borderBottomWidth: 1,
+      borderBottomColor: theme.border,
+    },
+    verseSubHeaderTitle: {
+      flex: 1,
+      flexShrink: 1,
       color: theme.textMuted,
       fontSize: 13,
+      fontWeight: '700',
+    },
+    verseSubHeaderCount: {
+      flexShrink: 0,
+      marginLeft: 10,
+      color: theme.primary,
+      fontSize: 12.5,
       fontWeight: '600',
-      paddingHorizontal: 16,
-      paddingBottom: 6,
     },
     spinner: { marginTop: 32 },
     errorText: { color: '#DC2626', fontSize: 13, marginTop: 16 },

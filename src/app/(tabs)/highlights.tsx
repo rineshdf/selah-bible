@@ -23,7 +23,6 @@ import {
   Pressable,
   ScrollView,
   SectionList,
-  StatusBar,
   StyleSheet,
   Text,
   View,
@@ -322,18 +321,6 @@ export default function HighlightsScreen() {
   const { theme } = useAppTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
-  /**
-   * Guaranteed top inset for every full-screen <Modal> header. Android
-   * edge-to-edge renders modal windows behind the status bar and camera
-   * cutout, so `insets.top` alone is not enough: take the platform status bar
-   * height too and enforce a 36px floor so `Close ✕` and the chapter title
-   * always sit safely below the clock, center cutout, and battery icon.
-   */
-  const topModalInset = Math.max(
-    insets.top,
-    Platform.OS === 'android' ? (StatusBar.currentHeight ?? 36) : 0,
-    36,
-  );
 
   const [highlights, setHighlights] = useState<HighlightRow[]>([]);
   const [installedMetas, setInstalledMetas] = useState<BibleVersionMeta[]>([]);
@@ -800,19 +787,28 @@ export default function HighlightsScreen() {
       />
 
       {/* Full-screen chapter reader over the highlighted verse — 100% of the
-          screen, zero black gap above the header. */}
+          screen, zero dead band above the header. `statusBarTranslucent={false}`
+          (the default, stated explicitly) makes the OS position the modal
+          window BELOW the status bar on Android, so the header only needs
+          tight padding — the old `topModalInset` band painted a blank
+          36-46px dark gap above `Close ✕` / `Genesis 1`. */}
       <Modal
         visible={contextHighlight !== null}
         animationType="slide"
         presentationStyle="fullScreen"
+        statusBarTranslucent={false}
         onRequestClose={() => setContextHighlight(null)}
       >
         <View style={[styles.readerScreen, { backgroundColor: theme.background }]}>
-          {/* Reader header — padding that clears the status bar with zero dead gap */}
+          {/* Reader header — clean, tight vertical padding (no nested wrapper
+              view above the header applies any extra paddingTop/margin). */}
           <View
             style={[
               styles.readerHeader,
-              { paddingTop: topModalInset + 10, paddingBottom: 12 },
+              {
+                paddingTop: Platform.OS === 'android' ? 12 : Math.max(insets.top, 12),
+                paddingBottom: 12,
+              },
             ]}
           >
             <ScalePressable
@@ -859,7 +855,7 @@ export default function HighlightsScreen() {
             </ScrollView>
           ) : null}
 
-          {contextAvailable && contextHighlight && !contextLoading ? (
+          {Boolean(contextAvailable && contextHighlight && !contextLoading) ? (
             <FlatList
               ref={chapterListRef}
               data={contextVerses}
@@ -878,13 +874,13 @@ export default function HighlightsScreen() {
                     highlightBg={highlightStyle?.backgroundColor ?? null}
                     highlightBorder={highlightStyle?.borderColor ?? null}
                     highlightText={highlightStyle?.textColor ?? null}
-                    isTarget={item.verse === contextHighlight.verse}
+                    isTarget={contextHighlight ? item.verse === contextHighlight.verse : false}
                     isDark={theme.isDark}
                     styles={styles}
                   />
                 );
               }}
-              extraData={`${contextHighlight.verse}|${theme.isDark}`}
+              extraData={`${contextHighlight?.verse ?? 0}|${theme.isDark}`}
               contentContainerStyle={styles.readerVerses}
               onScrollToIndexFailed={handleScrollToIndexFailed}
               initialNumToRender={12}
@@ -1033,9 +1029,9 @@ function makeStyles(theme: AppTheme) {
     readerHeader: {
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 10,
+      gap: 12,
       paddingHorizontal: 16,
-      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomWidth: 1,
       borderBottomColor: theme.border,
       backgroundColor: theme.surface,
     },

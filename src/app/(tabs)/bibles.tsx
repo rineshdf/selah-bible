@@ -3,7 +3,9 @@
  *
  * "Installed on Device" lists every version registered in
  * `@installed_bible_versions_v2` (language tag, full title, Use / Active, ✕
- * delete). Below it, "Available Bibles" shows the popular catalog by default
+ * delete). "Available Bibles" appears only while actively searching —
+ * without a query the screen shows just the installed library and
+ * Search Results show the matched catalog.
  * and synchronously filters the merged catalog (`POPULAR_BIBLE_VERSIONS` +
  * the one-flight `bibles/_catalog_cache.json`) whenever the user types — no
  * debounced network search. The header carries a Backup pill opening the
@@ -31,11 +33,13 @@ import { useAppTheme } from '@/constants/ThemeContext';
 import type { AppTheme } from '@/constants/colors';
 import {
   POPULAR_BIBLE_VERSIONS,
+  dropFailingVersions,
   filterVersions,
   groupVersionsByLanguage,
   getMergedCatalogVersions,
   type DownloadableVersion,
 } from '@/constants/versionCatalog';
+import SelahAppIconSvg from '@/components/SelahAppIconSvg';
 import {
   deleteBibleVersion,
   downloadBibleVersion,
@@ -54,9 +58,8 @@ import {
   restoreBackupFromUri,
   type SavedBackupItem,
 } from '@/db/backupManager';
-import AppHeader from '@/components/AppHeader';
 import { ScalePressable } from '@/components/ScalePressable';
-import { BackupCloudSvg } from '@/components/SvgIcons';
+import { BackupCloudSvg, SunMoonSvg } from '@/components/SvgIcons';
 
 type VersionRow =
   | { kind: 'section'; key: string; label: string; totalCount?: number; onExpandAll?: () => void; onCollapseAll?: () => void }
@@ -289,7 +292,7 @@ const LibraryRow = memo(function LibraryRow({
 });
 
 export default function BiblesScreen() {
-  const { theme } = useAppTheme();
+  const { theme, themeMode, toggleTheme } = useAppTheme();
   const styles = useMemo(() => makeStyles(theme), [theme]);
   const insets = useSafeAreaInsets();
   /**
@@ -341,11 +344,15 @@ export default function BiblesScreen() {
     return () => clearTimeout(timer);
   }, [backupOpen, refreshSavedBackups]);
 
-  /** One-flight fetch of the merged catalog (popular + online, deduped). */
+  /** One-flight fetch of the merged catalog (popular + online, deduped), with
+   * a health probe (Task 7) dropping dead popular ids before they can appear
+   * in any search. */
   useEffect(() => {
     const timer = setTimeout(() => {
       void getMergedCatalogVersions()
-        .then((versions) => setCatalog(versions))
+        .then(async (versions) => {
+          setCatalog(await dropFailingVersions(versions, 12));
+        })
         .catch(() => undefined);
     }, 0);
     return () => clearTimeout(timer);
@@ -364,6 +371,39 @@ export default function BiblesScreen() {
     );
     setDownloaded(downloadedMap);
   }, []);
+
+  /** Compute live counts for versions and languages in the merged catalog. */
+  const totalValidVersionsCount = useMemo(() => {
+    const byId = new Map<string, DownloadableVersion>();
+    for (const version of [...POPULAR_BIBLE_VERSIONS, ...catalog]) {
+      const key = normalizeVersionId(version.id);
+      if (!byId.has(key)) byId.set(key, version);
+    }
+    // Filter out invalid/broken versions (0 books, missing provider URLs)
+    let count = 0;
+    for (const version of byId.values()) {
+      const hasProvider = Boolean(version.helloaoTranslationId || version.downloadUrl);
+      if (hasProvider) count++;
+    }
+    return count;
+  }, [catalog]);
+
+  const totalValidLanguagesCount = useMemo(() => {
+    const byId = new Map<string, DownloadableVersion>();
+    for (const version of [...POPULAR_BIBLE_VERSIONS, ...catalog]) {
+      const key = normalizeVersionId(version.id);
+      if (!byId.has(key)) byId.set(key, version);
+    }
+    const languages = new Set<string>();
+    for (const version of byId.values()) {
+      const hasProvider = Boolean(version.helloaoTranslationId || version.downloadUrl);
+      if (hasProvider && version.languageName?.trim()) {
+        const baseLang = version.languageName.split('(')[0].trim().toLowerCase();
+        languages.add(baseLang);
+      }
+    }
+    return languages.size;
+  }, [catalog]);
 
   useFocusEffect(
     useCallback(() => {
@@ -532,17 +572,21 @@ export default function BiblesScreen() {
       }
     }
 
-    // Available Bibles / Search Results section
+    // Available Bibles / Search Results section — hidden completely until the
+    // user is actively searching; only Search Results show then.
+    if (!isSearching) {
+      return rows;
+    }
+
     const installedIds = new Set(installedMetas.map((meta) => normalizeVersionId(meta.id)));
-    const source = isSearching ? filterVersions(normalizedQuery, searchSource) : POPULAR_BIBLE_VERSIONS;
+    const source = filterVersions(normalizedQuery, searchSource);
     const matchingAvailable = source.filter((version) => !installedIds.has(normalizeVersionId(version.id)));
     const availableGroups = groupVersionsByLanguage(matchingAvailable);
 
-    const sectionLabel = isSearching ? `Search Results (${matchingAvailable.length})` : 'Available Bibles';
     rows.push({
       kind: 'section',
       key: 'available-section',
-      label: sectionLabel,
+      label: `Search Results (${matchingAvailable.length})`,
       onExpandAll: availableGroups.length > 0 ? expandAllAvailable : undefined,
       onCollapseAll: availableGroups.length > 0 ? collapseAllAvailable : undefined,
     });
@@ -551,7 +595,7 @@ export default function BiblesScreen() {
       rows.push({
         kind: 'empty',
         key: 'available-empty',
-        label: isSearching ? 'No other Bibles match your search.' : 'No other Bibles are available right now.',
+        label: 'No other Bibles match your search.',
       });
     }
     for (const group of availableGroups) {
@@ -725,9 +769,26 @@ export default function BiblesScreen() {
 
   return (
     <View style={[styles.screen, { backgroundColor: theme.background }]}>
-      <AppHeader
-        title="Bible Library"
-        right={(
+      {/* Task 2 — one unified header row: Left column (icon + title/subtitle
+          stack, flex 1) and Right actions row (Backup pill + theme toggle,
+          flexShrink 0). numberOfLines + adjustsFontSizeToFit on the subtitle
+          guarantee zero overlap with the Backup pill on any screen width. */}
+      <View style={[styles.bibleLibraryHeader, { paddingTop: insets.top + 6 }]}>
+        <View style={styles.bibleLibraryHeaderLeft}>
+          <SelahAppIconSvg size={24} color={theme.primary} />
+          <View style={styles.bibleLibraryHeaderTitleColumn}>
+            <Text numberOfLines={1} style={styles.bibleLibraryHeaderMainTitle}>Bible Library</Text>
+            <Text
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.85}
+              style={styles.bibleLibraryHeaderSubtitle}
+            >
+              {`${totalValidVersionsCount.toLocaleString()} Versions in ${totalValidLanguagesCount.toLocaleString()} Languages`}
+            </Text>
+          </View>
+        </View>
+        <View style={styles.bibleLibraryHeaderActions}>
           <ScalePressable
             style={styles.backupPill}
             onPress={() => setBackupOpen(true)}
@@ -737,8 +798,16 @@ export default function BiblesScreen() {
             <BackupCloudSvg size={18} color={theme.primary} />
             <Text style={styles.backupPillText}>Backup</Text>
           </ScalePressable>
-        )}
-      />
+          <ScalePressable
+            style={styles.headerThemeToggle}
+            onPress={toggleTheme}
+            accessibilityRole="button"
+            accessibilityLabel={`Switch to ${themeMode === 'dark' ? 'light' : 'dark'} theme`}
+          >
+            <SunMoonSvg isDark={themeMode === 'dark'} size={20} color={theme.primary} />
+          </ScalePressable>
+        </View>
+      </View>
       <FlatList
         style={styles.list}
         contentContainerStyle={styles.listContent}
@@ -893,17 +962,71 @@ function makeStyles(theme: AppTheme) {
     list: { flex: 1 },
     listContent: { paddingHorizontal: 16, paddingBottom: 32 },
     backupPill: {
+      height: 36,
+      paddingHorizontal: 12,
+      borderRadius: 18,
       flexDirection: 'row',
       alignItems: 'center',
+      justifyContent: 'center',
       gap: 6,
-      paddingHorizontal: 12,
-      paddingVertical: 7,
-      borderRadius: 20,
-      marginRight: 12,
-      backgroundColor: theme.surfaceMuted,
+      backgroundColor: theme.surface,
+      borderWidth: 1,
+      borderColor: theme.border,
     },
     backupPillText: { color: theme.primary, fontSize: 13, fontWeight: '700' },
-    searchWrapper: { marginTop: 10 },
+    headerThemeToggle: {
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      borderWidth: 1,
+      borderColor: theme.border,
+      backgroundColor: theme.surfaceMuted,
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    bibleLibraryHeader: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 10,
+      paddingHorizontal: 14,
+      paddingBottom: 10,
+      backgroundColor: theme.surface,
+      borderBottomWidth: StyleSheet.hairlineWidth,
+      borderBottomColor: theme.border,
+    },
+    bibleLibraryHeaderLeft: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+      paddingRight: 6,
+    },
+    bibleLibraryHeaderActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      flexShrink: 0,
+    },
+    bibleLibraryHeaderTitleColumn: {
+      flex: 1,
+      flexDirection: 'column',
+      justifyContent: 'center',
+    },
+    bibleLibraryHeaderMainTitle: {
+      fontSize: 19,
+      fontWeight: '800',
+      color: theme.text,
+      lineHeight: 24,
+    },
+    bibleLibraryHeaderSubtitle: {
+      fontSize: 11.5,
+      fontWeight: '600',
+      color: theme.subtext,
+      marginTop: 1,
+    },
+    searchWrapper: { marginTop: 6 },
     searchInputRow: {
       flexDirection: 'row',
       alignItems: 'center',
@@ -932,7 +1055,8 @@ function makeStyles(theme: AppTheme) {
       fontWeight: '700',
     },
     // Section heading with optional count badge and expand/collapse all actions
-    sectionHeading: { marginTop: 18, marginBottom: 4 },
+    // (compact top margin so no hollow gap sits below the search bar).
+    sectionHeading: { marginTop: 12, marginBottom: 4 },
     sectionHeadingRow: {
       flexDirection: 'row',
       alignItems: 'center',

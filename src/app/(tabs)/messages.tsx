@@ -52,6 +52,8 @@ import AppHeader from '@/components/AppHeader';
 import AnimatedCard from '@/components/AnimatedCard';
 import PremiumCalendarModal, { todayIsoDate } from '@/components/PremiumCalendarModal';
 import VersePickerModal, { type VersePickResult } from '@/components/VersePickerModal';
+import { ParsedVerseRows, formatVersesForStorage } from '@/components/VerseRows';
+import { isRtlVersionLabel } from '@/constants/books';
 import { CalendarSvg, SermonNotesSvg } from '@/components/SvgIcons';
 import SerialBadge from '@/components/SerialBadge';
 import { ScalePressable } from '@/components/ScalePressable';
@@ -388,7 +390,11 @@ function MessageEditorScreen({
         message_id: messageId,
         serial_no: nextSerial,
         block_type: 'verse',
-        content: draft.text,
+        // Tagged per-verse text ([1] … \n[2] …) so verse blocks render as
+        // badge rows; plain text is the legacy fallback shape.
+        content: draft.verses.length > 0
+          ? formatVersesForStorage(draft.verses)
+          : draft.text,
         verse_ref: `${draft.bookName} ${draft.chapter}:${draft.verse} · ${draft.versionShortName}`,
         verse_note: draft.note,
         highlight_color: null,
@@ -525,13 +531,13 @@ function MessageEditorScreen({
                     multiline
                   />
                   <Pressable
-                    style={styles.blockRemove}
+                    style={styles.blockRemoveCircle}
                     hitSlop={8}
                     onPress={() => removeBlock(block)}
                     accessibilityRole="button"
                     accessibilityLabel={`Delete heading ${block.content}`}
                   >
-                    <Text style={styles.blockRemoveText}>✕</Text>
+                    <Text style={styles.blockRemoveCircleText}>✕</Text>
                   </Pressable>
                 </View>
               );
@@ -573,13 +579,13 @@ function MessageEditorScreen({
                       multiline
                     />
                     <Pressable
-                      style={styles.blockRemove}
+                      style={styles.blockRemoveCircle}
                       hitSlop={8}
                       onPress={() => removeBlock(block)}
                       accessibilityRole="button"
                       accessibilityLabel={`Delete point ${pointNumberOf(blocks, block)}`}
                     >
-                      <Text style={styles.blockRemoveText}>✕</Text>
+                      <Text style={styles.blockRemoveCircleText}>✕</Text>
                     </Pressable>
                   </View>
                   {selected ? (
@@ -637,12 +643,17 @@ function MessageEditorScreen({
                     <Text style={styles.blockRemoveText}>✕</Text>
                   </Pressable>
                 </View>
-                <Text style={styles.verseContent}>{block.content}</Text>
+                <View style={styles.verseContentWrap}>
+                  <ParsedVerseRows
+                    text={block.content}
+                    rtl={isRtlVersionLabel(block.verse_ref ?? '')}
+                  />
+                </View>
                 <TextInput
                   style={styles.verseNoteInput}
                   value={block.verse_note ?? ''}
                   onChangeText={(text) => commitBlockNote(block, text)}
-                  placeholder="Note on this verse…"
+                  placeholder="Note on this scripture..."
                   placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
                   multiline
                 />
@@ -887,24 +898,48 @@ function makeStyles(theme: AppTheme) {
       justifyContent: 'center',
     },
     blocksSection: { gap: 8, marginTop: 16 },
+    // Point / Heading card recipe (spec): row container, vertically centered
+    // children, numbered badge left, input middle, round ✕ right.
     headingBlock: {
       flexDirection: 'row',
       alignItems: 'center',
-      borderRadius: 10,
+      justifyContent: 'space-between',
+      gap: 10,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderRadius: 14,
       borderWidth: 1,
       borderColor: theme.border,
       backgroundColor: theme.surfaceMuted,
-      paddingRight: 4,
     },
     headingInput: {
       flex: 1,
       color: theme.isDark ? '#F8FAFC' : '#0F172A',
       fontSize: 16,
       fontWeight: '700',
-      paddingHorizontal: 12,
-      paddingVertical: 10,
+      paddingHorizontal: 0,
+      paddingVertical: 4,
     },
+    // The verse block keeps the plain inline ✕; Point/Heading use the round one.
     blockRemove: { paddingHorizontal: 8, paddingVertical: 6 },
+    // Round 30×30 delete button, vertically centred in the middle row.
+    blockRemoveCircle: {
+      width: 30,
+      height: 30,
+      borderRadius: 15,
+      backgroundColor: theme.isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.06)',
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+      alignSelf: 'center',
+    },
+    blockRemoveCircleText: {
+      color: theme.textMuted,
+      fontSize: 14,
+      fontWeight: '700',
+      lineHeight: 16,
+      includeFontPadding: false,
+    },
     blockRemoveText: {
       color: theme.textMuted,
       fontSize: 13,
@@ -912,28 +947,36 @@ function makeStyles(theme: AppTheme) {
     },
     pointBlock: {
       flexDirection: 'row',
-      alignItems: 'flex-start',
-      borderRadius: 10,
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: 10,
+      paddingHorizontal: 12,
+      paddingVertical: 8,
+      borderRadius: 14,
       borderWidth: 1,
       borderColor: theme.border,
       backgroundColor: theme.surface,
-      paddingRight: 4,
     },
     pointBlockSelected: {
       borderColor: theme.primary,
       borderWidth: 2,
     },
+    // 26×26 rounded badge wrapper (tapping it opens the highlight palette).
     pointNumber: {
-      width: 38,
+      width: 26,
+      height: 26,
+      borderRadius: 8,
       alignItems: 'center',
-      paddingTop: 8,
+      justifyContent: 'center',
+      flexShrink: 0,
     },
     pointInput: {
       flex: 1,
       color: theme.isDark ? '#F8FAFC' : '#0F172A',
       fontSize: 15,
+      fontWeight: '600',
       lineHeight: 22,
-      paddingVertical: 10,
+      paddingVertical: 4,
       paddingHorizontal: 0,
     },
     pointPalette: {
@@ -1007,11 +1050,7 @@ function makeStyles(theme: AppTheme) {
       fontSize: 12,
       fontWeight: '700',
     },
-    verseContent: {
-      color: theme.text,
-      fontSize: 15,
-      lineHeight: 24,
-    },
+    verseContentWrap: { marginTop: 2 },
     verseNoteInput: {
       borderRadius: 8,
       borderWidth: 1,

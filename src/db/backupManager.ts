@@ -123,8 +123,8 @@ const TABLE_COLUMNS: Record<TableName, readonly string[]> = {
     'understanding_today', 'updated_at',
   ],
   prayer_points: [
-    'id', 'entry_date', 'request_text', 'is_answered', 'answered_date',
-    'verse_ref', 'verse_text', 'verse_note', 'verse_version_id',
+    'id', 'entry_date', 'request_text', 'is_answered', 'answered_date', 'answered_at',
+    'verse_ref', 'verse_text', 'verse_note', 'verse_version_id', 'color',
   ],
   reading_progress: ['book_id', 'chapter', 'read_date'],
   verse_read_progress: ['book_id', 'chapter', 'verse', 'read_at'],

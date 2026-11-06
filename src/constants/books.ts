@@ -311,6 +311,51 @@ const HEBREW_BOOK_NAMES: string[] = [
   '3 יוחנן', 'יהודה', 'התגלות',
 ];
 
+/** Deutsch (Luther 1951 / Schlachter). */
+const GERMAN_BOOK_NAMES: string[] = [
+  '1 Mose', '2 Mose', '3 Mose', '4 Mose', '5 Mose', 'Josua', 'Richter', 'Rut',
+  '1 Samuel', '2 Samuel', '1 Könige', '2 Könige', '1 Chronik', '2 Chronik',
+  'Esra', 'Nehemia', 'Ester', 'Hiob', 'Psalm', 'Sprüche', 'Prediger',
+  'Hohelied', 'Jesaja', 'Jeremia', 'Klagelieder', 'Hesekiel', 'Daniel',
+  'Hosea', 'Joel', 'Amos', 'Obadja', 'Jona', 'Micha', 'Nahum', 'Habakuk',
+  'Zefanja', 'Haggai', 'Sacharja', 'Maleachi', 'Matthäus', 'Markus', 'Lukas',
+  'Johannes', 'Apostelgeschichte', 'Römer', '1 Korinther', '2 Korinther',
+  'Galater', 'Epheser', 'Philipper', 'Kolosser', '1 Thessalonicher',
+  '2 Thessalonicher', '1 Timotheus', '2 Timotheus', 'Titus', 'Philemon',
+  'Hebräer', 'Jakobus', '1 Petrus', '2 Petrus', '1 Johannes', '2 Johannes',
+  '3 Johannes', 'Judas', 'Offenbarung',
+];
+
+/** Français (Louis Segond / APEE). */
+const FRENCH_BOOK_NAMES: string[] = [
+  'Genèse', 'Exode', 'Lévitique', 'Nombres', 'Deutéronome', 'Josué', 'Juges',
+  'Ruth', '1 Samuel', '2 Samuel', '1 Rois', '2 Rois', '1 Chroniques',
+  '2 Chroniques', 'Esdras', 'Néhémie', 'Esther', 'Job', 'Psaumes', 'Proverbes',
+  'Ecclésiaste', 'Cantique des Cantiques', 'Esaïe', 'Jérémie', 'Lamentations',
+  'Ezéchiel', 'Daniel', 'Osée', 'Joël', 'Amos', 'Abdias', 'Jonas', 'Michée',
+  'Nahum', 'Habacuc', 'Sophonie', 'Aggée', 'Zacharie', 'Malachie', 'Matthieu',
+  'Marc', 'Luc', 'Jean', 'Actes', 'Romains', '1 Corinthiens', '2 Corinthiens',
+  'Galates', 'Ephésiens', 'Philippiens', 'Colossiens', '1 Thessaloniciens',
+  '2 Thessaloniciens', '1 Timothée', '2 Timothée', 'Tite', 'Philemon',
+  'Hébreux', 'Jacques', '1 Pierre', '2 Pierre', '1 Jean', '2 Jean', '3 Jean',
+  'Jude', 'Apocalypse',
+];
+
+/** Português (João Ferreira de Almeida). */
+const PORTUGUESE_BOOK_NAMES: string[] = [
+  'Gênesis', 'Êxodo', 'Levítico', 'Números', 'Deuteronômio', 'Josué', 'Juízes',
+  'Rute', '1 Samuel', '2 Samuel', '1 Reis', '2 Reis', '1 Crônicas',
+  '2 Crônicas', 'Esdras', 'Neemias', 'Ester', 'Jó', 'Salmos', 'Provérbios',
+  'Eclesiastes', 'Cantares', 'Isaías', 'Jeremias', 'Lamentações', 'Ezequiel',
+  'Daniel', 'Oseias', 'Joel', 'Amós', 'Obadias', 'Jonas', 'Miquéias', 'Naum',
+  'Habacuque', 'Sofonias', 'Ageu', 'Zacarias', 'Malaquias', 'Mateus', 'Marcos',
+  'Lucas', 'João', 'Atos', 'Romanos', '1 Coríntios', '2 Coríntios', 'Gálatas',
+  'Efésios', 'Filipenses', 'Colossenses',
+  '1 Tessalonicenses', '2 Tessalonicenses', '1 Timóteo', '2 Timóteo', 'Tito',
+  'Filemom', 'Hebreus', 'Tiago', '1 Pedro', '2 Pedro', '1 João', '2 João',
+  '3 João', 'Judas', 'Apocalipse',
+];
+
 /** Language code -> canonical-id-indexed native book-name list. */
 export const NATIVE_BOOK_NAMES: Readonly<Record<string, readonly string[]>> = {
   mal: MALAYALAM_BOOK_NAMES,
@@ -321,7 +366,91 @@ export const NATIVE_BOOK_NAMES: Readonly<Record<string, readonly string[]>> = {
   es: SPANISH_BOOK_NAMES,
   heb: HEBREW_BOOK_NAMES,
   hbo: HEBREW_BOOK_NAMES,
+  deu: GERMAN_BOOK_NAMES,
+  ger: GERMAN_BOOK_NAMES,
+  fra: FRENCH_BOOK_NAMES,
+  fre: FRENCH_BOOK_NAMES,
+  por: PORTUGUESE_BOOK_NAMES,
+  pt: PORTUGUESE_BOOK_NAMES,
 };
+
+/**
+ * True when a payload book `name` is still a bare USFM-style code rather than
+ * a display title (`MAT`, `2PE`, `GEN`, ...) — e.g. helloao translations whose
+ * book records carry no `name`/`commonName`, or skeleton fallback rows built
+ * from `getUsfmBookCode()`. Code-like names must be replaced with localized
+ * book names before they reach the reader UI.
+ */
+export function isUsfmLikeBookName(name: string): boolean {
+  return /^[1-3]?[A-Z]{2,3}$/.test((name ?? '').trim());
+}
+
+/**
+ * True for right-to-left scripture languages (Hebrew Bible texts). Any
+ * version whose language/id matches renders its verse text with
+ * RTL typography (`row-reverse` rows, `textAlign: 'right'`,
+ * `writingDirection: 'rtl'`).
+ */
+export function isRtlScriptLanguage(input: string | undefined | null): boolean {
+  return /hebrew|עברית|aramaic|syriac/i.test((input ?? '').trim());
+}
+
+/**
+ * RTL verdict for a version metadata shape ({Version id / language/
+ * languageCode}), matching the codex ids (WLC / Aleppo / Modern Hebrew),
+ * ISO codes (`heb`, `hbo`) and human language names ("Hebrew (עברית)").
+ */
+export function isRtlVersionMeta(
+  version?:
+    | {
+        id?: string | null;
+        language?: string | null;
+        languageCode?: string | null;
+      }
+    | null,
+): boolean {
+  if (!version) return false;
+  const id = (version.id ?? '').trim().toLowerCase();
+  if (
+    id.startsWith('heb_') ||
+    id.startsWith('hbo_') ||
+    id.startsWith('heb') ||
+    id.includes('wlc') ||
+    id.includes('aleppo') ||
+    id.includes('masoretic')
+  ) {
+    return true;
+  }
+  const code = (version.languageCode ?? '').trim().toLowerCase();
+  if (code === 'heb' || code === 'hbo') return true;
+  return isRtlScriptLanguage(version.language ?? '');
+}
+
+/**
+ * RTL verdict for a free-form persisted version label
+ * (`"Hebrew (עברית) • WLC"`, `"Hebrew • Aleppo"`), used by scripture cards
+ * that only carry the display label of the version the verse came from.
+ */
+export function isRtlVersionLabel(label: string | undefined | null): boolean {
+  const value = (label ?? '').trim();
+  if (!value) return false;
+  if (isRtlScriptLanguage(value)) return true;
+  return /(^|[^A-Za-z])(WLC|Aleppo|ModernHebrew|ModHeb)([^A-Za-z]|$)/i.test(value);
+}
+
+/**
+ * Localized book name for one canonical id (1-66) in a version's language
+ * code: Tamil versions resolve through `BIBLE_BOOKS.tamilName`, every other
+ * registered language (spa/heb/mal/hin/tel/kan/deu/fra/por/...) through
+ * `NATIVE_BOOK_NAMES`. `null` when the language has no dictionary.
+ */
+export function localizedBookNameFor(languageCode: string | undefined | null, bookId: number): string | null {
+  const code = (languageCode ?? '').trim().toLowerCase();
+  if (!code || !Number.isInteger(bookId) || bookId < 1 || bookId > 66) return null;
+  if (code === 'tam') return getBookById(bookId)?.tamilName ?? null;
+  const list = NATIVE_BOOK_NAMES[code];
+  return list ? list[bookId - 1] ?? null : null;
+}
 
 // ---------------------------------------------------------------------------
 // Localized book-name resolution per active Bible version
@@ -377,9 +506,16 @@ export function getLocalizedBookName(
    * The version's native/common name always beats the generic dictionaries.
    */
   const versionBook = versionBooksById?.[book.id] ?? null;
-  const versionNative = versionBook
+  // A raw USFM code in the version's metadata (`1SA`, `GEN`) is NOT a display
+  // name: ignore it so the localized dictionary name for the version's
+  // language is shown instead of codes like `GEN` in `Select a Book`.
+  const rawVersionNative = versionBook
     ? versionBook.commonName || versionBook.name
     : undefined;
+  const versionNative =
+    rawVersionNative && !isUsfmLikeBookName(rawVersionNative)
+      ? rawVersionNative
+      : undefined;
 
   const isTamil =
     id === 'TAMIL_BSI' ||

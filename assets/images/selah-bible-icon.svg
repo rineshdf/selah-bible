@@ -1,27 +1,26 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 512 512">
-  
-  
-  <defs>
-    <radialGradient id="glow" cx="50%" cy="38%" r="72%">
-      <stop offset="0%" stop-color="#33415F" />
-      <stop offset="55%" stop-color="#26324A" />
-      <stop offset="100%" stop-color="#1B2437" />
-    </radialGradient>
-  </defs>
-  <rect width="512" height="512" fill="url(#glow)" />
-  <g transform="translate(59.20000000000002 59.20000000000002) scale(8.2)">
-    <g transform="translate(0,4.5)">
-      <g stroke="#E8BD72" stroke-width="1.6" stroke-linecap="round" fill="none" transform="translate(0,0)">
-             <path d="M24 3.5v4" /> <path d="M16.5 7l2.2 3" /> <path d="M31.5 7l-2.2 3" />
-             <path d="M19 12.5l-2.4 1" /> <path d="M29 12.5l2.4 1" />
-           </g>
-           <circle cx="24" cy="11" r="1.4" fill="#E8BD72" />
-      <path d="M31 15.5V30l3-2.2 3 2.2V14.9c-1.9-.2-4 0-6 .6Z" fill="#E8BD72" />
-      <path d="M31 15.5V30l3-2.2 3 2.2V14.9c-1.9-.2-4 0-6 .6Z" fill="none" stroke="#D5A94F" stroke-width="0.8" />
-      <g stroke="#F6EBD4" stroke-width="2.53" stroke-linecap="round" stroke-linejoin="round" fill="none">
-        <path d="M24 19c-5.4-3.5-11-4-17-1.7v20c6-2.3 11.6-1.8 17 1.7 5.4-3.5 11-4 17-1.7v-20C35 15 29.4 15.5 24 19Z" />
-        <path d="M24 19v20" />
-      </g>
-    </g></g>
-
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Selah Bible sunburst open-Bible mark, verbatim from SelahAppIconSvg.
+       Scale 32px/unit, centered: artwork (incl. strokes) spans x 240..784,
+       y 220..803 — inside the 62% Android adaptive-icon safe zone
+       (x: 194..830, y: 194..830) on the #0F172A background. -->
+  <rect width="1024" height="1024" fill="#0F172A" />
+  <g transform="translate(128 187.2) scale(32)">
+    <!-- Five sunburst rays, mirrored around x = 12 -->
+    <g stroke="#F5C469" stroke-width="1.1" stroke-linecap="round" fill="none">
+      <path d="M12 3.3 V1.6" />
+      <path d="M10.4 3.8 L9.3 2.4" />
+      <path d="M13.6 3.8 L14.7 2.4" />
+      <path d="M9.4 5.1 L7.8 4.5" />
+      <path d="M14.6 5.1 L16.2 4.5" />
+    </g>
+    <!-- Sun dot -->
+    <circle cx="12" cy="5.0" r="0.95" fill="#F5C469" />
+    <!-- Open Bible pages, mirrored around x = 12 -->
+    <path d="M12 7.5 C9.5 6.2 6.2 6.2 3.5 7.2 V18.5 C6.2 17.5 9.5 17.5 12 18.8 Z" fill="#7C9BFF" />
+    <path d="M12 7.5 C14.5 6.2 17.8 6.2 20.5 7.2 V18.5 C17.8 17.5 14.5 17.5 12 18.8 Z" fill="#7C9BFF" />
+    <!-- Centre spine -->
+    <path d="M12 7.5 V18.8" stroke="#7C9BFF" stroke-width="0.9" stroke-linecap="round" />
+    <!-- Golden ribbon bookmark on the right page -->
+    <path d="M15.2 6.7 H17.6 V15.2 L16.4 13.8 L15.2 15.2 Z" fill="#F5C469" />
+  </g>
 </svg>

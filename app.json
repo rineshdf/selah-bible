@@ -3,9 +3,18 @@
     "name": "Selah Bible",
     "slug": "selah-bible",
     "scheme": "selahbible",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "plugins": [
       "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#0F172A",
+          "image": "./assets/images/splash-icon.png",
+          "imageWidth": 200,
+          "resizeMode": "contain"
+        }
+      ],
       [
         "expo-build-properties",
         {
@@ -19,11 +28,11 @@
       "typedRoutes": true
     },
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/images/icon.png",
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/images/splash-icon.png",
       "resizeMode": "contain",
-      "backgroundColor": "#E6F4FE"
+      "backgroundColor": "#0F172A"
     },
     "userInterfaceStyle": "light",
     "ios": {
@@ -31,10 +40,9 @@
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#26324A",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
+        "backgroundColor": "#0F172A",
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "monochromeImage": "./assets/images/adaptive-icon-monochrome.png"
       },
       "package": "com.anonymous.selahbible"
     },

@@ -84,7 +84,10 @@ export interface PrayerPointRow {
   request_text: string;
   /** 0 = pending, 1 = answered. */
   is_answered: number;
+  /** 'YYYY-MM-DD' date the request was marked answered (legacy-safe mirror of answered_at). */
   answered_date: string | null;
+  /** 'YYYY-MM-DD' date the request was marked answered; NULL while unanswered. */
+  answered_at: string | null;
   /** Attached scripture promise reference (e.g. "John 3:16"), nullable for legacy rows. */
   verse_ref: string | null;
   /** Attached scripture promise text. */
@@ -93,16 +96,19 @@ export interface PrayerPointRow {
   verse_note: string | null;
   /** Version id the verse text was loaded from ('tamil_bsi', 'eng_kjv'...). */
   verse_version_id: string | null;
+  /** Highlight palette id picked by the user ('amber', 'emerald', 'sky', 'rose', 'violet'). */
+  color: string | null;
 }
 export type PrayerPointInput = Omit<
   PrayerPointRow,
-  'id' | 'is_answered' | 'verse_ref' | 'verse_text' | 'verse_note' | 'verse_version_id'
+  'id' | 'is_answered' | 'answered_at' | 'verse_ref' | 'verse_text' | 'verse_note' | 'verse_version_id' | 'color'
 > & {
   is_answered?: number;
   verse_ref?: string | null;
   verse_text?: string | null;
   verse_note?: string | null;
   verse_version_id?: string | null;
+  color?: string | null;
 };
 
 export type DailyEntrySection = 'rhema' | 'devotion' | 'worship';
@@ -269,10 +275,12 @@ const SCHEMA = `
     request_text TEXT NOT NULL,
     is_answered INTEGER NOT NULL DEFAULT 0,
     answered_date TEXT,
+    answered_at TEXT,
     verse_ref TEXT,
     verse_text TEXT,
     verse_note TEXT,
-    verse_version_id TEXT
+    verse_version_id TEXT,
+    color TEXT DEFAULT 'amber'
   );
   CREATE INDEX IF NOT EXISTS idx_prayer_points_date ON prayer_points (entry_date);
 
@@ -367,6 +375,10 @@ function migrateColumns(): void {
   ensureColumn('prayer_points', 'verse_text', 'TEXT');
   ensureColumn('prayer_points', 'verse_note', 'TEXT');
   ensureColumn('prayer_points', 'verse_version_id', 'TEXT');
+  // Highlight palette color (5-dot selector) on prayer request cards.
+  ensureColumn('prayer_points', 'color', "TEXT DEFAULT 'amber'");
+
+  ensureColumn('prayer_points', 'answered_at', 'TEXT');
   // Point-level scripture attachment for Rhema / Devotion / Worship entries.
   ensureColumn('daily_entries', 'verse_ref', 'TEXT');
   ensureColumn('daily_entries', 'verse_text', 'TEXT');
@@ -729,17 +741,19 @@ export function getSavedDailyWalkDates(): string[] {
 
 export function addPrayerPoint(input: PrayerPointInput): number {
   const result = db.runSync(
-    `INSERT INTO prayer_points (entry_date, request_text, is_answered, answered_date, verse_ref, verse_text, verse_note, verse_version_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?);`,
+    `INSERT INTO prayer_points (entry_date, request_text, is_answered, answered_date, answered_at, verse_ref, verse_text, verse_note, verse_version_id, color)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
     [
       input.entry_date,
       input.request_text,
       input.is_answered ?? 0,
       input.answered_date ?? null,
+      input.answered_date ?? null,
       input.verse_ref ?? null,
       input.verse_text ?? null,
       input.verse_note ?? null,
       input.verse_version_id ?? null,
+      input.color ?? null,
     ],
   );
   return result.lastInsertRowId;
@@ -751,6 +765,7 @@ export interface PrayerPointUpdate {
   verse_text?: string | null;
   verse_note?: string | null;
   verse_version_id?: string | null;
+  color?: string | null;
 }
 
 export function updatePrayerPoint(id: number, fields: PrayerPointUpdate): void {
@@ -762,6 +777,7 @@ export function updatePrayerPoint(id: number, fields: PrayerPointUpdate): void {
     'verse_text',
     'verse_note',
     'verse_version_id',
+    'color',
   ];
   for (const column of columns) {
     const value = fields[column];
@@ -792,9 +808,12 @@ export function getAllPrayerPoints(): PrayerPointRow[] {
 }
 
 export function setPrayerPointAnswered(id: number, isAnswered: boolean, answeredDate?: string | null): void {
+  // `answered_at` mirrors `answered_date` so Rewind status pills always have a
+  // full 'YYYY-MM-DD' timeline; both clear together when toggled unanswered.
+  const stamp = isAnswered ? answeredDate ?? isoDate() : null;
   db.runSync(
-    'UPDATE prayer_points SET is_answered = ?, answered_date = ? WHERE id = ?;',
-    [isAnswered ? 1 : 0, isAnswered ? answeredDate ?? isoDate() : null, id],
+    'UPDATE prayer_points SET is_answered = ?, answered_date = ?, answered_at = ? WHERE id = ?;',
+    [isAnswered ? 1 : 0, stamp, stamp, id],
   );
 }
 

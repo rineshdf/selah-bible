@@ -31,7 +31,7 @@
  * once, then cleared.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   LayoutAnimation,
   Modal,
@@ -79,6 +79,8 @@ import PremiumCalendarModal, {
   todayIsoDate,
 } from '@/components/PremiumCalendarModal';
 import VersePickerModal, { type VersePickResult } from '@/components/VersePickerModal';
+import { VerseRows, ParsedVerseRows, formatVersesForStorage, parseVerseRows } from '@/components/VerseRows';
+import { isRtlVersionLabel } from '@/constants/books';
 import SerialBadge from '@/components/SerialBadge';
 import { ScalePressable } from '@/components/ScalePressable';
 import {
@@ -129,6 +131,14 @@ function weekDates(weekStartIso: string): string[] {
   return Array.from({ length: 7 }, (_, index) => isoShifted(weekStartIso, index));
 }
 
+/** `Nov 6, 2026` — short local-calendar label for Rewind status pills and
+ * timelines ('YYYY-MM-DD' parsed without UTC shifting). */
+function formatShortDate(iso: string): string {
+  const date = isoToDate(iso);
+  if (!date || Number.isNaN(date.getTime())) return iso;
+  return `${MONTH_ABBRS[date.getMonth()]} ${date.getDate()}, ${date.getFullYear()}`;
+}
+
 /** Accordion card keys — strictly one card open at a time. */
 type CardKey = DailyEntrySection | 'prayer';
 
@@ -138,8 +148,8 @@ type PrayerFilter = 'all' | 'answered';
 type VerseTarget =
   | { kind: 'entry'; entryId: number }
   | { kind: 'prayer'; pointId: number }
-  /** Verse-first composer of the Rhema card (before Save Rhema). */
-  | { kind: 'rhema-new' }
+  /** Rhema composer: a picked Word attaches to (or auto-creates) the draft. */
+  | { kind: 'rhema-draft' }
   /** Verse that will be attached when the next prayer request is added. */
   | { kind: 'new-prayer' }
   /** Thanksgiving verse attached while marking a prayer answered. */
@@ -155,6 +165,15 @@ function versionLabelFor(result: VersePickResult): string {
   return `${result.languageName || '—'} • ${result.versionShortName}`;
 }
 
+/**
+ * Storage shape for `verse_text`: tagged per-verse text ("[1] … \n[2] …")
+ * so scripture cards can render number-badge rows; legacy combined text is
+ * the fallback shape.
+ */
+function verseTextForStorage(result: VersePickResult): string {
+  return result.verses.length > 0 ? formatVersesForStorage(result.verses) : result.text;
+}
+
 /** One archive row inside a Rewind Past Days date group. */
 type RewindItem = {
   kind: 'entry' | 'verse' | 'prayer';
@@ -164,7 +183,17 @@ type RewindItem = {
   verseRef: string | null;
   verseText: string | null;
   verseVersion: string | null;
+  /** Saved "Note on this scripture" attached to the verse, if any. */
+  verseNote: string | null;
   highlightColor: string | null;
+  /** Owning section — drives the symmetrical section icon in the card header. */
+  section: DailyEntrySection | 'prayer';
+  /** Prayer points only: 0 = pending, 1 = answered; 0 for entries/verses. */
+  isAnswered: number;
+  /** Prayer points only: 'YYYY-MM-DD' the request was marked answered. */
+  answeredDate: string | null;
+  /** 'YYYY-MM-DD' the row was saved (the Rewind date group itself). */
+  requestedDate: string;
 };
 
 /** One Rewind section: all matching notes saved on one date. */
@@ -176,12 +205,13 @@ type RewindSection = {
   data: RewindItem[];
 };
 
-/** Section emoji tags shown next to every Rewind serial badge. */
+/** Section labels shown next to every Rewind serial badge (icon is rendered
+ * separately by `rewindSectionIcon`, replacing the old emoji tags). */
 const REWIND_TAGS: Record<DailyEntrySection | 'prayer', string> = {
-  rhema: '✨ Rhema',
-  devotion: '📖 Devotion',
-  worship: '🙌 Worship',
-  prayer: '🙏 Prayer',
+  rhema: 'Rhema',
+  devotion: 'Devotion',
+  worship: 'Worship',
+  prayer: 'Prayer Point',
 };
 
 // ---------------------------------------------------------------------------
@@ -224,10 +254,6 @@ export default function DailyWalkScreen() {
   const [points, setPoints] = useState<PrayerPointRow[]>([]);
   const [hydrated, setHydrated] = useState(false);
 
-  /** Draft verse picked in the Rhema card's "1. Select Word of God" step. */
-  const [rhemaVerse, setRhemaVerse] = useState<VersePickResult | null>(null);
-  const [rhemaReflection, setRhemaReflection] = useState('');
-  const [rhemaColor, setRhemaColor] = useState<string | null>(null);
   /** Verse pending attachment to the next prayer request the user adds. */
   const [pendingPrayerVerse, setPendingPrayerVerse] = useState<VersePickResult | null>(null);
   /** Prayer intercepted by the "Mark Prayer as Answered" modal. */
@@ -239,9 +265,95 @@ export default function DailyWalkScreen() {
     devotion: '',
     worship: '',
   });
+  /** Composer-level highlight color per section (5-dot selector). */
+  const [newSectionColor, setNewSectionColor] = useState<Record<DailyEntrySection, string | null>>({
+    rhema: null,
+    devotion: null,
+    worship: null,
+  });
+  /** Highlight color staged for the next prayer request the user adds. */
+  const [prayerDraftColor, setPrayerDraftColor] = useState<string | null>(null);
   const [newRequest, setNewRequest] = useState('');
   const [selectedEntryId, setSelectedEntryId] = useState<number | null>(null);
   const [verseTarget, setVerseTarget] = useState<VerseTarget | null>(null);
+
+  // --- Rhema composer draft ("What God Spoke to Me") -------------------------
+  // The composer ALWAYS shows both controls: "1. Select Word of God" (+ the
+  // attached ScriptureBox once a verse is picked) and "2. What God Spoke to Me
+  // Through This Word" with the five highlight dots. Everything auto-saves:
+  // typing (350ms debounce), colour taps, verse picks and notes write
+  // straight to SQLite — no Save button exists.
+  /** SQLite row id currently backing the composer draft (null = none yet). */
+  const [activeRhemaDraftId, setActiveRhemaDraftId] = useState<number | null>(null);
+  const [rhemaDraftText, setRhemaDraftText] = useState('');
+  const [rhemaDraftColor, setRhemaDraftColor] = useState<string | null>(null);
+  /** Verse currently attached to the composer's draft ScriptureBox. */
+  const [rhemaDraftVerse, setRhemaDraftVerse] = useState<VersePickResult | null>(null);
+  /** True for ~1.8s after every successful auto-save ("✓ Auto-saved" chip). */
+  const [rhemaShowAutoSaved, setRhemaShowAutoSaved] = useState(false);
+  // Refs mirror the draft so debounce timers, insert callbacks and the flush
+  // path always write the LATEST values regardless of stale closures.
+  const activeRhemaDraftIdRef = useRef<number | null>(null);
+  const rhemaDraftTextRef = useRef('');
+  const rhemaDraftColorRef = useRef<string | null>(null);
+  const rhemaSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rhemaFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // --- Rhema draft auto-save helpers -----------------------------------------
+
+  /** Show the subtle "✓ Auto-saved" chip next to the dots for ~1.8s. */
+  const flashRhemaSaved = useCallback(() => {
+    if (rhemaFlashTimerRef.current) clearTimeout(rhemaFlashTimerRef.current);
+    setRhemaShowAutoSaved(true);
+    rhemaFlashTimerRef.current = setTimeout(() => {
+      rhemaFlashTimerRef.current = null;
+      setRhemaShowAutoSaved(false);
+    }, 1800);
+  }, []);
+
+  /** Commit a pending debounced reflection so timer edits are never lost. */
+  const flushRhemaDraft = useCallback(() => {
+    if (rhemaSaveTimerRef.current) {
+      clearTimeout(rhemaSaveTimerRef.current);
+      rhemaSaveTimerRef.current = null;
+      if (activeRhemaDraftIdRef.current !== null) {
+        updateDailyEntry(activeRhemaDraftIdRef.current, { content: rhemaDraftTextRef.current });
+        flashRhemaSaved();
+      }
+    }
+  }, [flashRhemaSaved]);
+
+  /**
+   * Hand the composer to a fresh draft: stop the debounce, drop the verse,
+   * colour and reflection, and unbind the SQLite row (it already lives in the
+   * list as its own card). Called by "+ New Rhema" and on date changes.
+   */
+  const resetRhemaDraft = useCallback(() => {
+    if (rhemaSaveTimerRef.current) {
+      clearTimeout(rhemaSaveTimerRef.current);
+      rhemaSaveTimerRef.current = null;
+    }
+    if (rhemaFlashTimerRef.current) {
+      clearTimeout(rhemaFlashTimerRef.current);
+      rhemaFlashTimerRef.current = null;
+    }
+    activeRhemaDraftIdRef.current = null;
+    setActiveRhemaDraftId(null);
+    rhemaDraftTextRef.current = '';
+    setRhemaDraftText('');
+    rhemaDraftColorRef.current = null;
+    setRhemaDraftColor(null);
+    setRhemaDraftVerse(null);
+    setRhemaShowAutoSaved(false);
+  }, []);
+
+  /** Finalize the composer's entry ("+ New Rhema") and start a fresh draft. */
+  const handleStartNewRhema = useCallback(() => {
+    flushRhemaDraft();
+    animateLayout();
+    resetRhemaDraft();
+    setEntries(getDailyEntriesForDate(selectedDate));
+  }, [flushRhemaDraft, resetRhemaDraft, selectedDate, setEntries]);
 
   // --- Day loading ---------------------------------------------------------
 
@@ -286,12 +398,24 @@ export default function DailyWalkScreen() {
 
   const loadDay = useCallback(
     (dateIso: string) => {
+      // The Rhema composer draft belongs to the day being left: commit its
+      // pending reflection, then hand the composer to the new day.
+      flushRhemaDraft();
+      resetRhemaDraft();
       setEntries(importLegacyDraft(dateIso));
       setVerseRows(getDailyVersesForDate(dateIso));
       setPoints(getPrayerPointsForDate(dateIso));
       setSelectedEntryId(null);
     },
-    [importLegacyDraft, setEntries, setPoints, setSelectedEntryId, setVerseRows],
+    [
+      flushRhemaDraft,
+      importLegacyDraft,
+      resetRhemaDraft,
+      setEntries,
+      setPoints,
+      setSelectedEntryId,
+      setVerseRows,
+    ],
   );
 
   const refreshSavedDates = useCallback(() => {
@@ -311,6 +435,122 @@ export default function DailyWalkScreen() {
     },
     [loadDay, setCalendarOpen, setSelectedDate, setRewindOpen],
   );
+
+  /**
+   * Auto-save the Rhema composer to SQLite. If the draft already owns a row
+   * (`activeRhemaDraftId`) the patch updates that exact row; otherwise the
+   * patch INSERTS the row now — an empty reflection is fine — and stores the
+   * new id so every later keystroke, colour tap or verse pick lands on the
+   * SAME Rhema entry.
+   */
+  const upsertRhemaDraft = useCallback(
+    (
+      fields: {
+        content?: string;
+        highlight_color?: string | null;
+        verse_ref?: string | null;
+        verse_text?: string | null;
+        verse_note?: string | null;
+        verse_version_id?: string | null;
+      },
+    ): number => {
+      const draftId = activeRhemaDraftIdRef.current;
+      if (draftId !== null) {
+        updateDailyEntry(draftId, fields);
+        flashRhemaSaved();
+        return draftId;
+      }
+      const newId = addDailyEntry({
+        entry_date: selectedDate,
+        section: 'rhema',
+        content: fields.content ?? rhemaDraftTextRef.current,
+        highlight_color: 'highlight_color' in fields
+          ? fields.highlight_color ?? null
+          : rhemaDraftColorRef.current,
+        verse_ref: fields.verse_ref ?? null,
+        verse_text: fields.verse_text ?? null,
+        verse_note: fields.verse_note ?? null,
+        verse_version_id: fields.verse_version_id ?? null,
+      });
+      activeRhemaDraftIdRef.current = newId;
+      setActiveRhemaDraftId(newId);
+      setEntries(getDailyEntriesForDate(selectedDate));
+      flashRhemaSaved();
+      return newId;
+    },
+    [flashRhemaSaved, selectedDate, setEntries],
+  );
+
+  /** 350ms-debounced auto-save of the draft reflection while typing. */
+  const handleRhemaDraftTextChange = useCallback(
+    (text: string) => {
+      setRhemaDraftText(text);
+      rhemaDraftTextRef.current = text;
+      if (rhemaSaveTimerRef.current) clearTimeout(rhemaSaveTimerRef.current);
+      rhemaSaveTimerRef.current = setTimeout(() => {
+        rhemaSaveTimerRef.current = null;
+        upsertRhemaDraft({ content: text });
+      }, 350);
+    },
+    [upsertRhemaDraft],
+  );
+
+  /** Tap a highlight dot: toggle the colour on the composer's draft row. */
+  const handleRhemaDraftColor = useCallback(
+    (hex: string) => {
+      const nextColor = rhemaDraftColorRef.current === hex ? null : hex;
+      rhemaDraftColorRef.current = nextColor;
+      setRhemaDraftColor(nextColor);
+      // With no row yet the stored colour rides along at insert time; once a
+      // draft row exists the colour is persisted immediately.
+      if (activeRhemaDraftIdRef.current !== null) {
+        upsertRhemaDraft({ highlight_color: nextColor });
+      }
+    },
+    [upsertRhemaDraft],
+  );
+
+  /** ScriptureBox note on the composer's attached verse (auto-persisted). */
+  const handleRhemaDraftNoteChange = useCallback(
+    (note: string) => {
+      setRhemaDraftVerse((current) => (current ? { ...current, note } : current));
+      upsertRhemaDraft({ verse_note: note });
+    },
+    [upsertRhemaDraft],
+  );
+
+  /** Detach the verse shown on the composer's draft ScriptureBox. */
+  const detachRhemaDraftVerse = useCallback(() => {
+    setRhemaDraftVerse(null);
+    const draftId = activeRhemaDraftIdRef.current;
+    if (draftId !== null) {
+      updateDailyEntry(draftId, {
+        verse_ref: null,
+        verse_text: null,
+        verse_note: null,
+        verse_version_id: null,
+      });
+      flashRhemaSaved();
+    }
+  }, [flashRhemaSaved]);
+
+  // Screen teardown: commit a pending debounced reflection so closing the
+  // tab mid-keystroke never loses text.
+  useEffect(() => {
+    return () => {
+      if (rhemaSaveTimerRef.current) {
+        clearTimeout(rhemaSaveTimerRef.current);
+        rhemaSaveTimerRef.current = null;
+        if (activeRhemaDraftIdRef.current !== null) {
+          updateDailyEntry(activeRhemaDraftIdRef.current, { content: rhemaDraftTextRef.current });
+        }
+      }
+      if (rhemaFlashTimerRef.current) {
+        clearTimeout(rhemaFlashTimerRef.current);
+        rhemaFlashTimerRef.current = null;
+      }
+    };
+  }, []);
 
   // First paint: hydrate rows for today (deferred so the effect body never
   // synchronously cascades into another render).
@@ -353,11 +593,36 @@ export default function DailyWalkScreen() {
     (section: DailyEntrySection) => {
       const text = newSectionText[section].trim();
       if (!text) return;
-      addDailyEntry({ entry_date: selectedDate, section, content: text });
+      addDailyEntry({
+        entry_date: selectedDate,
+        section,
+        content: text,
+        highlight_color: newSectionColor[section] ?? null,
+      });
       setNewSectionText((previous) => ({ ...previous, [section]: '' }));
+      setNewSectionColor((previous) => ({ ...previous, [section]: null }));
       setEntries(getDailyEntriesForDate(selectedDate));
     },
-    [newSectionText, selectedDate, setEntries, setNewSectionText],
+    [newSectionText, newSectionColor, selectedDate, setEntries, setNewSectionText, setNewSectionColor],
+  );
+
+  /** Toggle a highlight dot on a section composer (5-color palette). */
+  const toggleComposerColor = useCallback(
+    (section: DailyEntrySection, hex: string) => {
+      setNewSectionColor((previous) => ({
+        ...previous,
+        [section]: previous[section] === hex ? null : hex,
+      }));
+    },
+    [setNewSectionColor],
+  );
+
+  /** Toggle the highlight dot staged for the next prayer request. */
+  const togglePrayerDraftColor = useCallback(
+    (colorId: string) => {
+      setPrayerDraftColor((current) => (current === colorId ? null : colorId));
+    },
+    [setPrayerDraftColor],
   );
 
   const changeEntryContent = useCallback(
@@ -398,7 +663,7 @@ export default function DailyWalkScreen() {
       const ref = `${result.bookName} ${result.chapter}:${result.verse}`;
       const fields = {
         verse_ref: ref,
-        verse_text: result.text,
+        verse_text: verseTextForStorage(result),
         verse_note: result.note,
         verse_version_id: versionLabelFor(result),
       };
@@ -408,8 +673,32 @@ export default function DailyWalkScreen() {
       } else if (verseTarget.kind === 'prayer') {
         updatePrayerPoint(verseTarget.pointId, fields);
         setPoints(getPrayerPointsForDate(selectedDate));
-      } else if (verseTarget.kind === 'rhema-new') {
-        setRhemaVerse(result);
+      } else if (verseTarget.kind === 'rhema-draft') {
+        // Rhema composer flow: the picked Word auto-saves onto the composer's
+        // draft — creating the SQLite row instantly when the reflection is
+        // still empty, or attaching to the exact same entry when the user
+        // typed first (`activeRhemaDraftId`). No Save button involved.
+        setRhemaDraftVerse(result);
+        const draftId = activeRhemaDraftIdRef.current;
+        if (draftId !== null) {
+          updateDailyEntry(draftId, fields);
+          flashRhemaSaved();
+        } else {
+          const newId = addDailyEntry({
+            entry_date: selectedDate,
+            section: 'rhema',
+            content: rhemaDraftTextRef.current,
+            highlight_color: rhemaDraftColorRef.current,
+            verse_ref: ref,
+            verse_text: verseTextForStorage(result),
+            verse_note: result.note || null,
+            verse_version_id: versionLabelFor(result),
+          });
+          activeRhemaDraftIdRef.current = newId;
+          setActiveRhemaDraftId(newId);
+          flashRhemaSaved();
+        }
+        setEntries(getDailyEntriesForDate(selectedDate));
       } else if (verseTarget.kind === 'new-prayer') {
         setPendingPrayerVerse(result);
       } else if (verseTarget.kind === 'answered-verse') {
@@ -420,29 +709,8 @@ export default function DailyWalkScreen() {
       }
       setVerseTarget(null);
     },
-    [selectedDate, setEntries, setPoints, setRhemaVerse, setPendingPrayerVerse, setVerseTarget, verseTarget],
+    [flashRhemaSaved, selectedDate, setEntries, setPoints, setPendingPrayerVerse, setVerseTarget, verseTarget],
   );
-
-  /** Save Rhema: needs a verse (step 1) + non-empty reflection (step 2). */
-  const handleSaveRhema = useCallback(() => {
-    if (!rhemaVerse || !rhemaReflection.trim()) return;
-    animateLayout();
-    addDailyEntry({
-      entry_date: selectedDate,
-      section: 'rhema',
-      content: rhemaReflection.trim(),
-      highlight_color: rhemaColor,
-      verse_ref: `${rhemaVerse.bookName} ${rhemaVerse.chapter}:${rhemaVerse.verse}`,
-      verse_text: rhemaVerse.text,
-      verse_note: rhemaVerse.note || null,
-      verse_version_id: versionLabelFor(rhemaVerse),
-    });
-    setRhemaVerse(null);
-    setRhemaReflection('');
-    setRhemaColor(null);
-    setSelectedEntryId(null);
-    setEntries(getDailyEntriesForDate(selectedDate));
-  }, [rhemaColor, rhemaReflection, rhemaVerse, selectedDate, setEntries, setSelectedEntryId]);
 
   const detachEntryVerse = useCallback(
     (entry: DailyEntryRow) => {
@@ -502,17 +770,19 @@ export default function DailyWalkScreen() {
       entry_date: selectedDate,
       request_text: trimmed,
       answered_date: null,
+      ...(prayerDraftColor ? { color: prayerDraftColor } : {}),
       ...(pendingPrayerVerse ? {
         verse_ref: `${pendingPrayerVerse.bookName} ${pendingPrayerVerse.chapter}:${pendingPrayerVerse.verse}`,
-        verse_text: pendingPrayerVerse.text,
+        verse_text: verseTextForStorage(pendingPrayerVerse),
         verse_note: pendingPrayerVerse.note || null,
         verse_version_id: versionLabelFor(pendingPrayerVerse),
       } : {}),
     });
     setNewRequest('');
     setPendingPrayerVerse(null);
+    setPrayerDraftColor(null);
     setPoints(getPrayerPointsForDate(selectedDate));
-  }, [newRequest, pendingPrayerVerse, selectedDate, setNewRequest, setPendingPrayerVerse, setPoints]);
+  }, [newRequest, pendingPrayerVerse, prayerDraftColor, selectedDate, setNewRequest, setPendingPrayerVerse, setPrayerDraftColor, setPoints]);
 
   const handleTogglePoint = useCallback(
     (point: PrayerPointRow) => {
@@ -586,6 +856,18 @@ export default function DailyWalkScreen() {
     [setPoints],
   );
 
+  /** Toggle a highlight dot on a saved prayer point card (5-color palette). */
+  const changePointColor = useCallback(
+    (point: PrayerPointRow, colorId: string) => {
+      const next = point.color === colorId ? null : colorId;
+      setPoints((previous) => previous.map((row) => (
+        row.id === point.id ? { ...row, color: next } : row
+      )));
+      updatePrayerPoint(point.id, { color: next });
+    },
+    [setPoints],
+  );
+
   // --- Week strip -----------------------------------------------------------
 
   /** Fixed compact 7-day row for the week containing the selected date. */
@@ -625,7 +907,12 @@ export default function DailyWalkScreen() {
           verseRef: entry.verse_ref,
           verseText: entry.verse_text,
           verseVersion: entry.verse_version_id,
+          verseNote: entry.verse_note,
           highlightColor: entry.highlight_color,
+          section: entry.section,
+          isAnswered: 0,
+          answeredDate: null,
+          requestedDate: entry.entry_date,
         });
       }
       for (const verse of getDailyVersesForDate(date)) {
@@ -637,7 +924,12 @@ export default function DailyWalkScreen() {
           verseRef: verse.verse_ref,
           verseText: verse.verse_text,
           verseVersion: verse.version_short_name ?? null,
+          verseNote: verse.note,
           highlightColor: null,
+          section: verse.section,
+          isAnswered: 0,
+          answeredDate: null,
+          requestedDate: verse.entry_date,
         });
       }
       for (const point of getPrayerPointsForDate(date)) {
@@ -649,7 +941,14 @@ export default function DailyWalkScreen() {
           verseRef: point.verse_ref,
           verseText: point.verse_text,
           verseVersion: point.verse_version_id,
-          highlightColor: null,
+          verseNote: point.verse_note,
+          // Task 5 — prayer colors tint the Rewind archives too ('amber' ids).
+          highlightColor: point.color,
+          section: 'prayer',
+          // Task 3 — answered status + dates drive the Rewind status pill.
+          isAnswered: point.is_answered,
+          answeredDate: point.answered_at ?? point.answered_date,
+          requestedDate: point.entry_date,
         });
       }
       const matches = query
@@ -765,7 +1064,7 @@ export default function DailyWalkScreen() {
           </ScalePressable>
           <View style={styles.weekSwitcherCenter}>
             <Text style={styles.weekSwitcherLabel}>{dateBadgeLabel}</Text>
-            {selectedDate !== today ? (
+            {Boolean(selectedDate !== today) ? (
               <ScalePressable
                 style={styles.todayPill}
                 onPress={() => changeDate(today)}
@@ -851,96 +1150,104 @@ export default function DailyWalkScreen() {
           title="Rhema — Word from God"
           badge={selectedEntries('rhema').length}
         >
-        {/* Verse-first rhema composer: 1. Select Word → 2. What God Spoke → Save */}
+        {/* Rhema composer — "1. Select Word of God" and "2. What God Spoke to
+            Me Through This Word" are ALWAYS visible together. The reflection,
+            verse picks, note and colour auto-save to SQLite (350ms typing
+            debounce; verse/colour/note persist instantly) — no Save button.
+            "+ New Rhema" finalizes the draft so several entries per day are
+            effortless. */}
         <View style={styles.rhemaComposer}>
-          {rhemaVerse ? (
-            <View style={styles.scriptureBox}>
-              <View style={styles.scriptureHeader}>
-                <Text numberOfLines={1} style={styles.scriptureRef}>
-                  📖 {rhemaVerse.bookName} {rhemaVerse.chapter}:{rhemaVerse.verse}
-                </Text>
-                <Pressable
-                  hitSlop={6}
-                  onPress={() => setRhemaVerse(null)}
-                  accessibilityRole="button"
-                  accessibilityLabel="Remove selected Word of God verse"
-                >
-                  <Text style={styles.scriptureRemove}>✕</Text>
-                </Pressable>
-              </View>
-              <Text style={styles.scriptureText}>{rhemaVerse.text}</Text>
-              {rhemaVerse.note ? (
-                <Text numberOfLines={2} style={styles.scriptureDraftNote}>{rhemaVerse.note}</Text>
-              ) : null}
-              <View style={styles.languageBadge}>
-                <Text numberOfLines={1} style={styles.languageBadgeText}>
-                  {rhemaVerse.languageName || '—'} • {rhemaVerse.versionShortName}
-                </Text>
-              </View>
-            </View>
-          ) : (
-            <ScalePressable
-              style={styles.attachChipPrompt}
-              onPress={() => setVerseTarget({ kind: 'rhema-new' })}
-              accessibilityRole="button"
-              accessibilityLabel="Select Word of God — add a Bible verse first"
-            >
-              <Text numberOfLines={1} style={styles.attachChipPromptText}>
-                📖 1. Select Word of God (Add Bible Verse First)
-              </Text>
-            </ScalePressable>
-          )}
-
-          <Text style={styles.rhemaStepLabel}>
+          {/* 1 — Word of God (+ attached ScriptureBox while a verse is picked) */}
+          <ScalePressable
+            style={styles.attachChipPrompt}
+            onPress={() => setVerseTarget({ kind: 'rhema-draft' })}
+            accessibilityRole="button"
+            accessibilityLabel="Select Word of God — pick a Bible verse for this Rhema"
+          >
+            <Text numberOfLines={1} style={styles.attachChipPromptText}>
+              1. Select Word of God
+            </Text>
+          </ScalePressable>
+          {Boolean(rhemaDraftVerse) ? (
+            <ScriptureBox
+              theme={theme}
+              styles={styles}
+              reference={
+                rhemaDraftVerse
+                  ? `${rhemaDraftVerse.bookName} ${rhemaDraftVerse.chapter}:${rhemaDraftVerse.verse}`
+                  : ''
+              }
+              versionLabel={rhemaDraftVerse ? versionLabelFor(rhemaDraftVerse) : ''}
+              text={rhemaDraftVerse ? verseTextForStorage(rhemaDraftVerse) : ''}
+              note={rhemaDraftVerse?.note ?? ''}
+              onNoteChange={handleRhemaDraftNoteChange}
+              onDetach={detachRhemaDraftVerse}
+              onChangeVerse={() => setVerseTarget({ kind: 'rhema-draft' })}
+            />
+          ) : null}
+          {/* 2 — What God Spoke to Me (auto-saved while typing) */}
+          <Text style={styles.rhemaComposerLabel}>
             2. What God Spoke to Me Through This Word
           </Text>
           <TextInput
-            style={styles.reflectionInput}
+            style={styles.pointInput}
+            value={rhemaDraftText}
+            onChangeText={handleRhemaDraftTextChange}
             placeholder="Write the promise, instruction, or revelation God gave you from this verse..."
             placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
-            value={rhemaReflection}
-            onChangeText={setRhemaReflection}
             multiline
           />
-          <View style={styles.colorRow}>
-            {HIGHLIGHT_COLORS.map((color) => {
-              const active = rhemaColor === color.hex;
-              return (
+          {/* Task 5 — bottom action/color bar: the 5 highlight dots on the
+              left, the concise "✓ Saved" status (never clips or drops
+              letters) and the "+ Add" pill on the right. */}
+          <View style={styles.composerActionBar}>
+            <View style={styles.composerDots}>
+              {HIGHLIGHT_COLORS.map((color) => {
+                const active = rhemaDraftColor === color.hex;
+                return (
+                  <ScalePressable
+                    key={color.key}
+                    style={[
+                      styles.composerColorDot,
+                      { backgroundColor: color.hex },
+                      active ? styles.colorDotActive : null,
+                    ]}
+                    onPress={() => handleRhemaDraftColor(color.hex)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Highlight Rhema draft in ${color.englishName}`}
+                  />
+                );
+              })}
+            </View>
+            <View style={styles.composerActions}>
+              {Boolean(rhemaShowAutoSaved) ? (
+                <Text numberOfLines={1} style={styles.rhemaAutoSavedText}>✓ Saved</Text>
+              ) : null}
+              {Boolean(rhemaDraftText.trim().length > 0 || rhemaDraftVerse) ? (
                 <ScalePressable
-                  key={color.key}
-                  style={[
-                    styles.colorDot,
-                    { backgroundColor: color.hex },
-                    active ? styles.colorDotActive : null,
-                  ]}
-                  onPress={() => setRhemaColor(active ? null : color.hex)}
+                  style={styles.composerAddButton}
+                  onPress={handleStartNewRhema}
                   accessibilityRole="button"
-                  accessibilityLabel={`${color.englishName} highlight for this word${active ? ' (selected)' : ''}`}
-                />
-              );
-            })}
+                  accessibilityLabel="Add a new Rhema entry"
+                >
+                  <Text style={styles.composerAddText}>+ Add</Text>
+                </ScalePressable>
+              ) : null}
+            </View>
           </View>
-          <ScalePressable
-            style={[
-              styles.addButton,
-              !rhemaVerse || !rhemaReflection.trim() ? styles.addButtonDisabled : null,
-            ]}
-            onPress={handleSaveRhema}
-            disabled={!rhemaVerse || !rhemaReflection.trim()}
-            accessibilityRole="button"
-            accessibilityLabel="Save Rhema"
-          >
-            <Text style={styles.addButtonText}>Save Rhema</Text>
-          </ScalePressable>
         </View>
+        {/* Saved cards for the day — the composer's own draft row stays inside
+            the composer above (never duplicated below it). */}
         <EntrySectionBody
           theme={theme}
           styles={styles}
           section="rhema"
-          entries={selectedEntries('rhema')}
+          entries={selectedEntries('rhema').filter((entry) => entry.id !== activeRhemaDraftId)}
           legacyVerses={legacyVersesOf('rhema')}
           newEntryText={newSectionText.rhema}
           placeholder={placeholders.rhema}
+          composerColor={newSectionColor.rhema}
+          onComposerColorChange={(hex) => toggleComposerColor('rhema', hex)}
           selectedEntryId={selectedEntryId}
           onSelectEntry={(id) => setSelectedEntryId(id)}
           onAddEntry={addSectionEntry}
@@ -977,6 +1284,8 @@ export default function DailyWalkScreen() {
             legacyVerses={legacyVersesOf('devotion')}
             newEntryText={newSectionText.devotion}
             placeholder={placeholders.devotion}
+            composerColor={newSectionColor.devotion}
+            onComposerColorChange={(hex) => toggleComposerColor('devotion', hex)}
             selectedEntryId={selectedEntryId}
             onSelectEntry={(id) => setSelectedEntryId(id)}
             onAddEntry={addSectionEntry}
@@ -1012,6 +1321,8 @@ export default function DailyWalkScreen() {
             legacyVerses={legacyVersesOf('worship')}
             newEntryText={newSectionText.worship}
             placeholder={placeholders.worship}
+            composerColor={newSectionColor.worship}
+            onComposerColorChange={(hex) => toggleComposerColor('worship', hex)}
             selectedEntryId={selectedEntryId}
             onSelectEntry={(id) => setSelectedEntryId(id)}
             onAddEntry={addSectionEntry}
@@ -1055,7 +1366,12 @@ export default function DailyWalkScreen() {
                   <Text style={styles.scriptureRemove}>✕</Text>
                 </Pressable>
               </View>
-              <Text numberOfLines={2} style={styles.scriptureText}>{pendingPrayerVerse.text}</Text>
+              <VerseRows
+                rows={pendingPrayerVerse.verses.length > 0
+                  ? pendingPrayerVerse.verses.map((verse) => ({ verse: verse.verse, text: verse.text }))
+                  : [{ verse: null, text: pendingPrayerVerse.text }]}
+                rtl={isRtlVersionLabel(pendingPrayerVerse.languageName || pendingPrayerVerse.versionShortName)}
+              />
               <View style={styles.languageBadge}>
                 <Text numberOfLines={1} style={styles.languageBadgeText}>
                   {pendingPrayerVerse.languageName || '—'} • {pendingPrayerVerse.versionShortName}
@@ -1073,14 +1389,37 @@ export default function DailyWalkScreen() {
               onSubmitEditing={handleAddPoint}
               returnKeyType="done"
             />
-            <ScalePressable
-              style={[styles.addButton, newRequest.trim() ? null : styles.addButtonDisabled]}
-              onPress={handleAddPoint}
-              accessibilityRole="button"
-              accessibilityLabel={pendingPrayerVerse ? 'Add prayer request with attached verse' : 'Add prayer request'}
-            >
-              <Text style={styles.addButtonText}>{pendingPrayerVerse ? 'Add + Verse' : 'Add'}</Text>
-            </ScalePressable>
+          </View>
+          {/* Task 5 — unified composer action/color bar for Prayer Points. */}
+          <View style={styles.composerActionBar}>
+            <View style={styles.composerDots}>
+              {HIGHLIGHT_COLORS.map((color) => {
+                const active = prayerDraftColor === color.id;
+                return (
+                  <ScalePressable
+                    key={color.key}
+                    style={[
+                      styles.composerColorDot,
+                      { backgroundColor: color.hex },
+                      active ? styles.colorDotActive : null,
+                    ]}
+                    onPress={() => togglePrayerDraftColor(color.id)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Highlight new prayer requests in ${color.englishName}`}
+                  />
+                );
+              })}
+            </View>
+            <View style={styles.composerActions}>
+              <ScalePressable
+                style={[styles.composerAddButton, newRequest.trim() ? null : styles.addButtonDisabled]}
+                onPress={handleAddPoint}
+                accessibilityRole="button"
+                accessibilityLabel={pendingPrayerVerse ? 'Add prayer request with attached verse' : 'Add prayer request'}
+              >
+                <Text style={styles.composerAddText}>{pendingPrayerVerse ? 'Add + Verse' : 'Add'}</Text>
+              </ScalePressable>
+            </View>
           </View>
           <ScalePressable
             style={styles.attachChip}
@@ -1132,18 +1471,47 @@ export default function DailyWalkScreen() {
           ) : (
             filteredPoints.map((point, index) => {
               const answered = point.is_answered === 1;
+              // Task 5 — the picked highlight color tints the saved prayer
+              // card (bg / border / badge / text) just like the other
+              // sections, in both the main view and Rewind.
+              const pointHighlight = point.color
+                ? getHighlightStyle(point.color, theme.isDark)
+                : null;
+              // Narrowed verse locals keep the Boolean(...) child gates both
+              // crash-proof (empty strings never leak into <View>) and
+              // type-safe for the strictly-typed ScriptureBox props.
+              const pointVerseText = point.verse_text ?? '';
+              const pointVerseRef = point.verse_ref ?? '';
+              const hasPointVerse = Boolean(
+                pointVerseText.trim().length > 0 && pointVerseRef.trim().length > 0,
+              );
               return (
                 <View key={point.id} style={styles.pointStack}>
                   <View
                     style={[
                       styles.pointBlock,
                       answered ? styles.pointBlockAnswered : null,
+                      pointHighlight
+                        ? {
+                            backgroundColor: pointHighlight.backgroundColor,
+                            borderColor: pointHighlight.borderColor,
+                            borderLeftWidth: 3,
+                          }
+                        : null,
                     ]}
                   >
                     <View style={styles.pointTopRow}>
-                      <SerialBadge number={index + 1} />
+                      <SerialBadge
+                        number={index + 1}
+                        color={pointHighlight?.backgroundColor}
+                        textColor={pointHighlight?.textColor}
+                        borderColor={pointHighlight?.borderColor}
+                      />
                       <TextInput
-                        style={styles.pointInput}
+                        style={[
+                          styles.pointInput,
+                          pointHighlight ? { color: pointHighlight.textColor } : null,
+                        ]}
                         value={point.request_text}
                         onChangeText={(text) => changePointText(point, text)}
                         placeholder="Add a prayer request (e.g., Family health, wisdom, exams)..."
@@ -1169,18 +1537,38 @@ export default function DailyWalkScreen() {
                         <Text style={styles.pointRemoveIcon}>✕</Text>
                       </Pressable>
                     </View>
-                    {answered && point.answered_date ? (
+                    {/* Task 5 — always-visible 5-color dots on each saved
+                        prayer card (color applies in this view + Rewind). */}
+                    <View style={styles.rhemaInlineColorRow}>
+                      {HIGHLIGHT_COLORS.map((color) => {
+                        const active = point.color === color.id;
+                        return (
+                          <ScalePressable
+                            key={color.key}
+                            style={[
+                              styles.colorDot,
+                              { backgroundColor: color.hex },
+                              active ? styles.colorDotActive : null,
+                            ]}
+                            onPress={() => changePointColor(point, color.id)}
+                            accessibilityRole="button"
+                            accessibilityLabel={`Highlight prayer point ${index + 1} in ${color.englishName}`}
+                          />
+                        );
+                      })}
+                    </View>
+                    {Boolean(answered && point.answered_date) ? (
                       <Text style={styles.pointAnsweredDate}>
                         ✓ Answered · {point.answered_date}
                       </Text>
                     ) : null}
-                    {point.verse_text && point.verse_ref ? (
+                    {hasPointVerse ? (
                       <ScriptureBox
                         theme={theme}
                         styles={styles}
-                        reference={point.verse_ref}
+                        reference={pointVerseRef}
                         versionLabel={point.verse_version_id ?? ''}
-                        text={point.verse_text}
+                        text={pointVerseText}
                         note={point.verse_note ?? ''}
                         onNoteChange={(note) => changePointVerseNote(point, note)}
                         onDetach={() => detachPointVerse(point)}
@@ -1262,7 +1650,7 @@ export default function DailyWalkScreen() {
               onChangeText={setRewindSearch}
               returnKeyType="search"
             />
-            {rewindSearch ? (
+            {Boolean(rewindSearch) ? (
               <Pressable
                 onPress={() => setRewindSearch('')}
                 accessibilityRole="button"
@@ -1307,7 +1695,7 @@ export default function DailyWalkScreen() {
           </View>
 
           {/* Single-date calendar filter chip */}
-          {rewindDateFilter ? (
+          {Boolean(rewindDateFilter) ? (
             <ScalePressable
               style={styles.rewindFilterChip}
               onPress={() => setRewindDateFilter(null)}
@@ -1315,8 +1703,8 @@ export default function DailyWalkScreen() {
               accessibilityLabel="Clear the date filter"
             >
               <Text style={styles.rewindFilterChipText}>
-                Showing only {isoToDate(rewindDateFilter).getDate()}{' '}
-                {MONTH_ABBRS[isoToDate(rewindDateFilter).getMonth()]} — tap to clear ✕
+                Showing only {isoToDate(rewindDateFilter!).getDate()}{' '}
+                {MONTH_ABBRS[isoToDate(rewindDateFilter!).getMonth()]} — tap to clear ✕
               </Text>
             </ScalePressable>
           ) : null}
@@ -1476,7 +1864,9 @@ function AccordionCard({
         accessibilityState={{ expanded: open }}
         accessibilityLabel={`${open ? 'Collapse' : 'Expand'} ${title}`}
       >
-        {icon}
+        {/* Task 2 — every section icon sits in the same uniform 32x32 rounded
+            badge so the four headers align identically. */}
+        <View style={styles.sectionIconBadge}>{icon}</View>
         <Text numberOfLines={1} style={styles.cardTitle}>{title}</Text>
         <View style={styles.cardBadge}>
           <Text style={styles.cardBadgeText}>{badge}</Text>
@@ -1493,6 +1883,21 @@ function AccordionCard({
 // any attached verse (highlight-tinted like the Highlights cards)
 // ---------------------------------------------------------------------------
 
+/** Symmetrical section icon + compact badge rendered in every Rewind header
+ * row (Task 2 — replaces the old raw emoji tags). */
+function rewindSectionIcon(section: DailyEntrySection | 'prayer', color: string): React.JSX.Element {
+  switch (section) {
+    case 'rhema':
+      return <SparkleRhemaSvg size={16} color={color} />;
+    case 'devotion':
+      return <BibleBookSvg size={16} color={color} />;
+    case 'worship':
+      return <PrayerHandsSvg size={16} color={color} />;
+    case 'prayer':
+      return <ChecklistSvg size={16} color={color} />;
+  }
+}
+
 function RewindItemCard({
   item,
   index,
@@ -1507,6 +1912,22 @@ function RewindItemCard({
   const highlight = item.highlightColor
     ? getHighlightStyle(item.highlightColor, theme.isDark)
     : null;
+  // Task 4 — no empty reflection gap: the body <Text> renders only when the
+  // entry actually carries text, so the verse block sits right beneath the
+  // badge row when "What God Spoke to Me" was left empty.
+  const hasMainText = Boolean(item.text && String(item.text).trim().length > 0);
+  // Task 4 — "Note on this scripture" persisted with the verse renders in a
+  // dedicated read-only note box at the bottom of every Rewind card.
+  const scriptureNote = item.verseNote ?? '';
+  const hasScriptureNote = Boolean(scriptureNote && scriptureNote.trim().length > 0);
+  const hasVerseBlock = Boolean(
+    item.verseText
+    && String(item.verseText).trim().length > 0
+    && item.verseRef
+    && String(item.verseRef).trim().length > 0,
+  );
+  const isPrayer = item.kind === 'prayer';
+  const answered = isPrayer && item.isAnswered === 1;
   return (
     <View
       style={[
@@ -1515,25 +1936,84 @@ function RewindItemCard({
       ]}
     >
       <View style={styles.rewindItemTopRow}>
-        <SerialBadge
-          number={index + 1}
-          color={highlight?.backgroundColor}
-          textColor={highlight?.textColor}
-          borderColor={highlight?.borderColor}
-        />
-        <Text style={styles.rewindTag}>{item.tag}</Text>
+        {/* Task 3 — left: index badge + symmetrical section icon + label. */}
+        <View style={styles.rewindItemHeaderLeft}>
+          <SerialBadge
+            number={index + 1}
+            color={highlight?.backgroundColor}
+            textColor={highlight?.textColor}
+            borderColor={highlight?.borderColor}
+          />
+          <View style={styles.rewindIconBadge}>{rewindSectionIcon(item.section, theme.primary)}</View>
+          <Text
+            numberOfLines={1}
+            style={[styles.rewindTag, highlight ? { color: highlight.textColor } : null]}
+          >
+            {item.tag}
+          </Text>
+        </View>
+        {/* Task 3 — right: Answered / Not Answered status + date pill on
+            prayer cards, always visible at a glance. */}
+        {isPrayer && answered ? (
+          <View style={[styles.rewindStatusPill, styles.rewindStatusAnswered]}>
+            <Text
+              numberOfLines={1}
+              style={[styles.rewindStatusPillText, styles.rewindStatusAnsweredText]}
+            >
+              {`✓ Answered • ${formatShortDate(item.answeredDate ?? item.requestedDate)}`}
+            </Text>
+          </View>
+        ) : null}
+        {isPrayer && !answered ? (
+          <View style={[styles.rewindStatusPill, styles.rewindStatusPending]}>
+            <Text
+              numberOfLines={1}
+              style={[styles.rewindStatusPillText, styles.rewindStatusPendingText]}
+            >
+              {`Not Answered • ${formatShortDate(item.requestedDate)}`}
+            </Text>
+          </View>
+        ) : null}
       </View>
-      <Text style={[styles.rewindItemText, highlight ? { color: highlight.textColor } : null]}>
-        {item.text}
-      </Text>
-      {item.verseText && item.verseRef ? (
-        <View style={styles.rewindVerseBox}>
+      {hasMainText ? (
+        <Text style={[styles.rewindItemText, highlight ? { color: highlight.textColor } : null]}>
+          {item.text}
+        </Text>
+      ) : null}
+      {hasVerseBlock ? (
+        <View style={[styles.rewindVerseBox, !hasMainText ? styles.rewindVerseBoxFirst : null]}>
           <View style={styles.languageBadge}>
             <Text numberOfLines={1} style={styles.languageBadgeText}>
               {item.verseRef} ({item.verseVersion || '—'})
             </Text>
           </View>
-          <Text style={styles.rewindVerseText}>{item.verseText}</Text>
+          {/* Task 4 — structured [5]-badge verse rows, identical to the main
+              Daily Walk scripture cards (never one unreadable blob). */}
+          <ParsedVerseRows
+            text={String(item.verseText)}
+            rtl={isRtlVersionLabel(item.verseVersion ?? '')}
+            textColor={highlight?.textColor}
+          />
+        </View>
+      ) : null}
+      {hasScriptureNote ? (
+        <View style={styles.rewindNoteBox}>
+          <Text style={styles.rewindNoteLabel}>Note on this scripture</Text>
+          <Text style={styles.rewindNoteText}>{scriptureNote.trim()}</Text>
+        </View>
+      ) : null}
+      {/* Task 3 — full prayer timeline footer once a request is answered, so
+          the user sees exactly when it was asked and when God answered. */}
+      {isPrayer && answered && item.answeredDate ? (
+        <View
+          style={[styles.rewindTimelineRow, highlight ? { borderTopColor: highlight.borderColor } : null]}
+        >
+          <Text style={[styles.rewindTimelineText, highlight ? { color: highlight.textColor } : null]}>
+            {`Requested: ${formatShortDate(item.requestedDate)}`}
+          </Text>
+          <Text style={[styles.rewindTimelineText, highlight ? { color: highlight.textColor } : null]}>
+            {`Answered: ${formatShortDate(item.answeredDate)}`}
+          </Text>
         </View>
       ) : null}
     </View>
@@ -1565,6 +2045,10 @@ function ScriptureBox({
   onDetach: () => void;
   onChangeVerse: () => void;
 }) {
+  const verseRows = useMemo(() => parseVerseRows(text), [text]);
+  // Hebrew codices render Right-to-Left: the persisted version label
+  // (`"Hebrew (עברית) • WLC"`) carries the verdict.
+  const isRtlVerse = isRtlVersionLabel(versionLabel);
   return (
     <View style={styles.scriptureBox}>
       <View style={styles.scriptureHeader}>
@@ -1580,14 +2064,14 @@ function ScriptureBox({
           <Text style={styles.scriptureRemove}>✕</Text>
         </Pressable>
       </View>
-      {versionLabel ? (
+      {Boolean(versionLabel && String(versionLabel).trim().length > 0) ? (
         <View style={styles.languageBadge}>
           <Text numberOfLines={1} style={styles.languageBadgeText}>
             {versionLabel}
           </Text>
         </View>
       ) : null}
-      <Text style={styles.scriptureText}>{text}</Text>
+      <VerseRows rows={verseRows} rtl={isRtlVerse} />
       <TextInput
         style={styles.noteInput}
         value={note}
@@ -1621,6 +2105,8 @@ function EntrySectionBody({
   legacyVerses,
   newEntryText,
   placeholder,
+  composerColor,
+  onComposerColorChange,
   selectedEntryId,
   onSelectEntry,
   onAddEntry,
@@ -1642,6 +2128,10 @@ function EntrySectionBody({
   legacyVerses: DailyVerseRow[];
   newEntryText: string;
   placeholder: string;
+  /** Highlight color staged in the section composer (5-dot selector). */
+  composerColor: string | null;
+  /** Toggle a highlight dot on the section composer. */
+  onComposerColorChange: (hex: string) => void;
   selectedEntryId: number | null;
   onSelectEntry: (id: number | null) => void;
   onAddEntry: (section: DailyEntrySection) => void;
@@ -1665,6 +2155,35 @@ function EntrySectionBody({
         const highlightStyle = entry.highlight_color
           ? getHighlightStyle(entry.highlight_color, theme.isDark)
           : null;
+        // Narrowed verse locals — Boolean(...) keeps empty strings out of
+        // <View> children while keeping ScriptureBox props type-safe.
+        const entryVerseText = entry.verse_text ?? '';
+        const entryVerseRef = entry.verse_ref ?? '';
+        const hasEntryVerse = Boolean(
+          entryVerseText.trim().length > 0 && entryVerseRef.trim().length > 0,
+        );
+        // Rhema cards are a dedicated inline pattern: debounced reflection,
+        // always-visible colour dots, auto-saved verse — no Save button.
+        if (section === 'rhema') {
+          return (
+            <RhemaEntryCard
+              key={entry.id}
+              entry={entry}
+              index={index}
+              theme={theme}
+              styles={styles}
+              selected={selected}
+              highlightStyle={highlightStyle}
+              onSelectEntry={onSelectEntry}
+              onCommitContent={onEntryContentChange}
+              onColorToggle={onEntryColorToggle}
+              onRemoveEntry={onRemoveEntry}
+              onAttachVerse={onAttachVerse}
+              onDetachEntryVerse={onDetachEntryVerse}
+              onEntryVerseNoteChange={onEntryVerseNoteChange}
+            />
+          );
+        }
         return (
           <View key={entry.id} style={styles.pointStack}>
             <View
@@ -1713,14 +2232,14 @@ function EntrySectionBody({
                   <Text style={styles.pointRemoveIcon}>✕</Text>
                 </Pressable>
               </View>
-              {entry.verse_text && entry.verse_ref ? (
+              {Boolean(hasEntryVerse) ? (
                 <>
                   <ScriptureBox
                     theme={theme}
                     styles={styles}
-                    reference={entry.verse_ref}
+                    reference={entryVerseRef}
                     versionLabel={entry.verse_version_id ?? ''}
-                    text={entry.verse_text}
+                    text={entryVerseText}
                     note={entry.verse_note ?? ''}
                     onNoteChange={(note) => onEntryVerseNoteChange(entry, note)}
                     onDetach={() => onDetachEntryVerse(entry)}
@@ -1776,7 +2295,9 @@ function EntrySectionBody({
       {legacyVerses.map((verse) => (
         <View key={verse.id} style={styles.scriptureBox}>
           <View style={styles.scriptureHeader}>
-            <Text style={styles.scriptureVersion}>{verse.version_short_name ?? ''}</Text>
+            {Boolean(verse.version_short_name && String(verse.version_short_name).trim().length > 0) ? (
+              <Text style={styles.scriptureVersion}>{verse.version_short_name}</Text>
+            ) : null}
             <Text numberOfLines={1} style={styles.scriptureRef}>
               📖 {verse.verse_ref}
             </Text>
@@ -1789,7 +2310,10 @@ function EntrySectionBody({
               <Text style={styles.scriptureRemove}>✕</Text>
             </Pressable>
           </View>
-          <Text style={styles.scriptureText}>{verse.verse_text}</Text>
+          <ParsedVerseRows
+            text={verse.verse_text ?? ''}
+            rtl={isRtlVersionLabel(verse.version_short_name ?? '')}
+          />
           <TextInput
             style={styles.noteInput}
             value={verse.note ?? ''}
@@ -1801,29 +2325,244 @@ function EntrySectionBody({
         </View>
       ))}
 
-      {/* Add point row: aligned input + Add button (hidden for the rhema flow) */}
+      {/* Add point row: aligned input, then the unified action/color bar —
+          the 5 highlight dots on the left and the Add button on the right. */}
       {!hideComposer ? (
-        <View style={styles.addRow}>
-          <TextInput
-            style={styles.addInput}
-            placeholder={placeholder}
-            placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
-            value={newEntryText}
-            onChangeText={onNewEntryTextChange}
-            onSubmitEditing={() => onAddEntry(section)}
-            returnKeyType="done"
-          />
-          <ScalePressable
-            style={[styles.addButton, newEntryText.trim() ? null : styles.addButtonDisabled]}
-            onPress={() => onAddEntry(section)}
-            accessibilityRole="button"
-            accessibilityLabel="Add new point"
-          >
-            <Text style={styles.addButtonText}>Add</Text>
-          </ScalePressable>
-        </View>
+        <>
+          <View style={styles.addRow}>
+            <TextInput
+              style={styles.addInput}
+              placeholder={placeholder}
+              placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
+              value={newEntryText}
+              onChangeText={onNewEntryTextChange}
+              onSubmitEditing={() => onAddEntry(section)}
+              returnKeyType="done"
+            />
+          </View>
+          <View style={styles.composerActionBar}>
+            <View style={styles.composerDots}>
+              {HIGHLIGHT_COLORS.map((color) => {
+                const active = composerColor === color.hex;
+                return (
+                  <ScalePressable
+                    key={color.key}
+                    style={[
+                      styles.composerColorDot,
+                      { backgroundColor: color.hex },
+                      active ? styles.colorDotActive : null,
+                    ]}
+                    onPress={() => onComposerColorChange(color.hex)}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Set ${section} composer highlight to ${color.englishName}`}
+                  />
+                );
+              })}
+            </View>
+            <View style={styles.composerActions}>
+              <ScalePressable
+                style={[styles.composerAddButton, newEntryText.trim() ? null : styles.addButtonDisabled]}
+                onPress={() => onAddEntry(section)}
+                accessibilityRole="button"
+                accessibilityLabel="Add new point"
+              >
+                <Text style={styles.composerAddText}>Add</Text>
+              </ScalePressable>
+            </View>
+          </View>
+        </>
       ) : null}
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RhemaEntryCard — auto-saved Rhema point with an inline, 400ms-debounced
+// reflection input and always-visible colour dots. No Save button: the entry
+// row (and its picked verse) already lives in SQLite when the card shows.
+// ---------------------------------------------------------------------------
+
+function RhemaEntryCard({
+  entry,
+  index,
+  theme,
+  styles,
+  selected,
+  highlightStyle,
+  onSelectEntry,
+  onCommitContent,
+  onColorToggle,
+  onRemoveEntry,
+  onAttachVerse,
+  onDetachEntryVerse,
+  onEntryVerseNoteChange,
+}: {
+  entry: DailyEntryRow;
+  index: number;
+  theme: AppTheme;
+  styles: ReturnType<typeof makeStyles>;
+  selected: boolean;
+  highlightStyle: ReturnType<typeof getHighlightStyle> | null;
+  onSelectEntry: (id: number | null) => void;
+  onCommitContent: (entry: DailyEntryRow, content: string) => void;
+  onColorToggle: (entry: DailyEntryRow, hex: string) => void;
+  onRemoveEntry: (entry: DailyEntryRow) => void;
+  onAttachVerse: (entry: DailyEntryRow) => void;
+  onDetachEntryVerse: (entry: DailyEntryRow) => void;
+  onEntryVerseNoteChange: (entry: DailyEntryRow, note: string) => void;
+}) {
+  const [reflection, setReflection] = useState(entry.content);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const latestRef = useRef(entry.content);
+  const commitRef = useRef(onCommitContent);
+  // Narrowed verse locals — Boolean(...) keeps empty strings out of <View>
+  // children while keeping ScriptureBox props strictly typed (string).
+  const verseText = entry.verse_text ?? '';
+  const verseRef = entry.verse_ref ?? '';
+  const hasVerse = Boolean(
+    verseText.trim().length > 0 && verseRef.trim().length > 0,
+  );
+
+  // Keep the commit callback mirror current (refs are written in effects,
+  // never during render).
+  useEffect(() => {
+    commitRef.current = onCommitContent;
+  });
+
+  // NOTE: the card is keyed by `entry.id` upstream, so an entry swap re-mounts
+  // and the initializer picks the fresh content — no sync effect required.
+
+  /** Debounced inline save — 400ms after the last keystroke. */
+  const commitSoon = useCallback(
+    (value: string) => {
+      latestRef.current = value;
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        timerRef.current = null;
+        commitRef.current(entry, value);
+      }, 400);
+    },
+    [entry],
+  );
+
+  useEffect(() => {
+    return () => {
+      // Flush on unmount/entry swap so the last edits are never lost.
+      if (timerRef.current) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+        if (latestRef.current !== entry.content) {
+          commitRef.current(entry, latestRef.current);
+        }
+      }
+    };
+  }, [entry]);
+
+  return (
+    <View style={styles.pointStack}>
+      <View
+        style={[
+          styles.pointBlock,
+          highlightStyle
+            ? {
+                backgroundColor: highlightStyle.backgroundColor,
+                borderColor: highlightStyle.borderColor,
+                borderLeftWidth: 3,
+              }
+            : null,
+        ]}
+      >
+        <View style={styles.pointTopRow}>
+          <Pressable
+            onPress={() => onSelectEntry(selected ? null : entry.id)}
+            accessibilityRole="button"
+            accessibilityLabel={`Select Rhema point ${index + 1}`}
+          >
+            <SerialBadge
+              number={index + 1}
+              color={highlightStyle?.backgroundColor}
+              textColor={highlightStyle?.textColor}
+              borderColor={highlightStyle?.borderColor}
+            />
+          </Pressable>
+          <TextInput
+            style={[
+              styles.pointInput,
+              highlightStyle ? { color: highlightStyle.textColor } : null,
+            ]}
+            value={reflection}
+            onChangeText={(text) => {
+              setReflection(text);
+              commitSoon(text);
+            }}
+            placeholder="What God spoke to me..."
+            placeholderTextColor={theme.isDark ? '#94A3B8' : '#64748B'}
+            multiline
+          />
+          <Pressable
+            style={styles.pointRemove}
+            hitSlop={8}
+            onPress={() => onRemoveEntry(entry)}
+            accessibilityRole="button"
+            accessibilityLabel={`Delete Rhema point ${index + 1}`}
+          >
+            <Text style={styles.pointRemoveIcon}>✕</Text>
+          </Pressable>
+        </View>
+        {Boolean(selected) ? (
+          <View style={styles.rhemaInlineColorRow}>
+            {HIGHLIGHT_COLORS.map((color) => {
+              const active = entry.highlight_color === color.hex;
+              return (
+                <ScalePressable
+                  key={color.key}
+                  style={[
+                    styles.colorDot,
+                    { backgroundColor: color.hex },
+                    active ? styles.colorDotActive : null,
+                  ]}
+                  onPress={() => onColorToggle(entry, color.hex)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Highlight Rhema point ${index + 1} in ${color.englishName}`}
+                />
+              );
+            })}
+            <ScalePressable
+              style={styles.paletteDone}
+              onPress={() => onSelectEntry(null)}
+              accessibilityRole="button"
+              accessibilityLabel="Done highlighting Rhema point"
+            >
+              <Text style={styles.paletteDoneText}>Done</Text>
+            </ScalePressable>
+          </View>
+        ) : null}
+        {Boolean(hasVerse) ? (
+          <ScriptureBox
+            theme={theme}
+            styles={styles}
+            reference={verseRef}
+            versionLabel={entry.verse_version_id ?? ''}
+            text={verseText}
+            note={entry.verse_note ?? ''}
+            onNoteChange={(note) => onEntryVerseNoteChange(entry, note)}
+            onDetach={() => onDetachEntryVerse(entry)}
+            onChangeVerse={() => onAttachVerse(entry)}
+          />
+        ) : (
+          <ScalePressable
+            style={styles.attachChipPrompt}
+            onPress={() => onAttachVerse(entry)}
+            accessibilityRole="button"
+            accessibilityLabel={`Change or add Bible verse to Rhema point ${index + 1}`}
+          >
+            <Text numberOfLines={1} style={styles.attachChipPromptText}>
+              📖 + Add supporting Bible verse to Rhema #{index + 1}
+            </Text>
+          </ScalePressable>
+        )}
+      </View>
+    </View>
   );
 }
 
@@ -2071,6 +2810,17 @@ function makeStyles(theme: AppTheme) {
       gap: 8,
       paddingVertical: 4,
     },
+    // Task 2 — uniform 32x32 rounded badge every accordion section icon
+    // renders inside, so all four headers align identically.
+    sectionIconBadge: {
+      width: 32,
+      height: 32,
+      borderRadius: 9,
+      backgroundColor: theme.primary + '18',
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
     cardTitle: {
       flex: 1,
       color: theme.text,
@@ -2249,6 +2999,70 @@ function makeStyles(theme: AppTheme) {
       fontWeight: '700',
       lineHeight: 22,
     },
+    // Rhema composer — "1. Select Word of God" + "2. What God Spoke to Me"
+    // always visible together, with the five highlight dots, the subtle
+    // auto-save chip and the "+ New Rhema" pill in one bottom row.
+    rhemaComposer: { gap: 10 },
+    rhemaComposerLabel: {
+      color: theme.text,
+      fontSize: 13.5,
+      fontWeight: '700',
+      lineHeight: 20,
+      marginTop: 2,
+    },
+    // Task 5 — unified bottom action/color bar for ALL section composers:
+    // the 5 highlight dots left, the auto-save status + Add button right.
+    composerActionBar: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      marginTop: 12,
+      gap: 8,
+      width: '100%',
+    },
+    composerDots: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 10,
+      flexShrink: 0,
+    },
+    composerColorDot: {
+      width: 28,
+      height: 28,
+      borderRadius: 14,
+      borderWidth: 1,
+      borderColor: theme.border,
+    },
+    composerActions: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'flex-end',
+      gap: 8,
+      flex: 1,
+    },
+    composerAddButton: {
+      paddingHorizontal: 14,
+      height: 34,
+      borderRadius: 17,
+      backgroundColor: theme.primary,
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    composerAddText: {
+      fontSize: 13,
+      fontWeight: '800',
+      color: '#FFFFFF',
+      includeFontPadding: false,
+    },
+    rhemaAutoSavedText: {
+      fontSize: 12,
+      fontWeight: '700',
+      color: theme.primary,
+      includeFontPadding: false,
+      flexShrink: 0,
+      paddingHorizontal: 4,
+    },
     addRow: { flexDirection: 'row', gap: 8 },
     addInput: {
       flex: 1,
@@ -2264,15 +3078,7 @@ function makeStyles(theme: AppTheme) {
       paddingHorizontal: 14,
       paddingVertical: 12,
     },
-    addButton: {
-      borderRadius: 10,
-      backgroundColor: theme.primary,
-      paddingHorizontal: 16,
-      justifyContent: 'center',
-      minHeight: 48,
-    },
     addButtonDisabled: { opacity: 0.4 },
-    addButtonText: { color: theme.primaryForeground, fontSize: 14, fontWeight: '700' },
     filterRow: { flexDirection: 'row', gap: 8 },
     filterPill: {
       borderRadius: 999,
@@ -2489,41 +3295,108 @@ function makeStyles(theme: AppTheme) {
       borderColor: theme.border,
       backgroundColor: theme.surface,
       padding: 10,
+      marginBottom: 8,
+    },
+    // Task 3 — space-between header: index badge + icon + label on the left,
+    // Answered / Not Answered status pill on the right (prayer cards).
+    rewindItemTopRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
       gap: 8,
       marginBottom: 8,
     },
-    rewindItemTopRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-    rewindTag: { color: theme.textMuted, fontSize: 12, fontWeight: '700' },
+    rewindItemHeaderLeft: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      flexShrink: 1,
+    },
+    // Task 2 — compact 26x26 rounded icon badge beside each Rewind serial
+    // badge (same tint as the section headers), replacing raw emoji tags.
+    rewindIconBadge: {
+      width: 26,
+      height: 26,
+      borderRadius: 8,
+      backgroundColor: theme.primary + '18',
+      alignItems: 'center',
+      justifyContent: 'center',
+      flexShrink: 0,
+    },
+    rewindTag: { color: theme.textMuted, fontSize: 12, fontWeight: '700', flexShrink: 1 },
     rewindItemText: { color: theme.text, fontSize: 14, lineHeight: 21 },
-    rewindVerseBox: { gap: 6 },
-    rewindVerseText: { color: theme.textMuted, fontSize: 13, lineHeight: 20 },
-    rewindEmpty: { color: theme.textMuted, textAlign: 'center', marginTop: 40, fontSize: 14 },
-    // Rhema verse-first composer (1. select verse → 2. reflection → Save)
-    rhemaComposer: { gap: 10 },
-    rhemaStepLabel: {
-      color: theme.textMuted,
-      fontSize: 13,
-      fontWeight: '700',
-      lineHeight: 22,
+    // Task 4 — verse block inside a Rewind card: sits directly beneath the
+    // badge row (marginTop 0) when the reflection text itself is empty so no
+    // hollow gap is left where "What God Spoke to Me" was never written.
+    rewindVerseBox: { gap: 6, marginTop: 8 },
+    rewindVerseBoxFirst: { marginTop: 0 },
+    // Task 3 — status pill (Answered = emerald, Not Answered = amber).
+    rewindStatusPill: {
+      flexShrink: 1,
+      paddingHorizontal: 10,
+      paddingVertical: 4,
+      borderRadius: 12,
+      borderWidth: 1,
     },
-    reflectionInput: {
-      minHeight: 92,
-      textAlignVertical: 'top',
-      lineHeight: 22,
-      fontSize: 15,
+    rewindStatusAnswered: {
+      backgroundColor: theme.isDark ? 'rgba(16, 185, 129, 0.22)' : 'rgba(16, 185, 129, 0.16)',
+      borderColor: '#10B981',
+    },
+    rewindStatusPending: {
+      backgroundColor: theme.isDark ? 'rgba(245, 158, 11, 0.20)' : 'rgba(245, 158, 11, 0.14)',
+      borderColor: '#F59E0B',
+    },
+    rewindStatusPillText: { fontSize: 11.5, fontWeight: '800' },
+    rewindStatusAnsweredText: { color: theme.isDark ? '#34D399' : '#059669' },
+    rewindStatusPendingText: { color: theme.isDark ? '#FBBF24' : '#D97706' },
+    // Task 3 — subtle requested/answered timeline under answered prayers.
+    rewindTimelineRow: {
+      marginTop: 8,
+      paddingTop: 8,
+      borderTopWidth: StyleSheet.hairlineWidth,
+      borderTopColor: theme.border,
+      flexDirection: 'row',
+      alignItems: 'center',
+      flexWrap: 'wrap',
+      gap: 12,
+    },
+    rewindTimelineText: {
+      fontSize: 11,
+      fontWeight: '600',
+      color: theme.subtext,
+    },
+    // Task 4 — read-only "Note on this scripture" box at the bottom of a
+    // Rewind scripture card.
+    rewindNoteBox: {
+      marginTop: 8,
+      paddingHorizontal: 10,
+      paddingVertical: 8,
       borderRadius: 10,
-      borderWidth: inputPalette.borderWidth,
-      borderColor: inputPalette.borderColor,
-      backgroundColor: inputPalette.backgroundColor,
-      color: inputPalette.color,
-      paddingHorizontal: 14,
-      paddingVertical: 12,
+      backgroundColor: theme.isDark ? 'rgba(15, 23, 42, 0.55)' : 'rgba(255, 255, 255, 0.75)',
+      borderWidth: 1,
+      borderColor: theme.border,
     },
-    scriptureDraftNote: {
-      color: theme.textMuted,
-      fontSize: 12,
-      lineHeight: 18,
-      fontStyle: 'italic',
+    rewindNoteLabel: {
+      fontSize: 11,
+      fontWeight: '700',
+      color: theme.subtext,
+      marginBottom: 2,
+    },
+    rewindNoteText: {
+      fontSize: 13.5,
+      fontWeight: '600',
+      color: theme.text,
+      lineHeight: 19,
+    },
+    rewindEmpty: { color: theme.textMuted, textAlign: 'center', marginTop: 40, fontSize: 14 },
+    // Rhema entry cards: always-visible inline colour dots under reflection
+    rhemaInlineColorRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      flexWrap: 'wrap',
+      gap: 10,
+      marginTop: 4,
+      marginBottom: 8,
     },
     languageBadge: {
       alignSelf: 'flex-start',
